@@ -167,6 +167,19 @@ node tools/memory-transfer.mjs rollback <snapshot>     # 需要时整体回滚
 
 导入已存在的会话时默认**合并**（视作一次保存追加进那条记忆，去重、超上限则拒绝并报告），可用 `--on-existing skip|replace` 改变；`--remap` 让导入的会话用新 id 并存、原 id 记入 `origin.originSessionId`。
 
+### 记忆层级
+
+记忆按四级组织，**上一级不足以解决问题时才读下一级**：
+
+| 级 | 内容 | 何时进入上下文 |
+|---|---|---|
+| 1 全局 | 用户画像 + 全局索引（每会话一条：标题 + 高浓度摘要） | **每轮注入** |
+| 2 条目索引 | `keyPoint`：只写"该不该去读这一条记忆"的结论 | 同上（属于第 1 级的一部分） |
+| 3 条目内容 | `sessions/<id>.json` 里的完整记忆正文（含过程档案指针） | 按需 `recall_memory` / `load_session_memory` |
+| 4 文档 | 会话产出的过程档案（若有） | 第 3 级不足时，由模型按指针读取 |
+
+因此第 2 级**不携带文档位置、路径或"细节见 X"**——这类信息属于第 3 级；写入时会自动剥离（`stripPointersFromKeyPoint`），摘要超限按子句边界截断。
+
 ### 数据位置
 
 `$DSH_HOME/memory/`（通常 `~/.dsh/memory/`）：

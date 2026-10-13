@@ -89,11 +89,11 @@ const DEFAULT_INHERIT_FORK_MEMORY = true
  * session memory is retrieved later at the cost of a recall — so it holds
  * conclusions and pointers, never the process that produced them.
  */
-export const SAVE_MEMORY_CONTENT_RULE = "CONTENT RULE: this session keeps ONE memory, and that memory is a durable reference — keep it to conclusions, current state, trade-offs that cannot be re-derived, coordinates (paths, commands, numbers) and a pointer to where the process record lives (a project document or repository file). Process narrative, measured figures, pitfall stories, changelogs and commit hashes belong in that document, NOT here; write the pointer once instead of copying the detail." 
+export const SAVE_MEMORY_CONTENT_RULE = "HIERARCHY: injected profile/index -> this entry's keyPoint -> this memory's content -> the process document (if any). Each level is read only when the level above cannot answer — so the keyPoint must be a dense conclusion that tells the reader whether to open this memory, and MUST NOT contain document locations or paths (the document pointer belongs in the content). CONTENT RULE: this session keeps ONE memory, and that memory is a durable reference — keep it to conclusions, current state, trade-offs that cannot be re-derived, coordinates (paths, commands, numbers) and a pointer to where the process record lives (a project document or repository file). Process narrative, measured figures, pitfall stories, changelogs and commit hashes belong in that document, NOT here; write the pointer once instead of copying the detail." 
 /* ------------------------- transfer (export / import) -------------------- */
 const TRANSFER_PATH = '/api/dsh-memory-transfer'
 const TRANSFER_DIR = 'transfer'
-const PLUGIN_VERSION = '2.19.3'
+const PLUGIN_VERSION = '2.19.4'
 const EXPORT_KIND = 'dsh-structured-memory-export'
 const EXPORT_FORMAT = 1
 const TRANSFER_MAX_BYTES = 5 * 1024 * 1024
@@ -835,13 +835,37 @@ function truncateChars(text, max) {
  * Normalize a keyPoint to the agreed budget: default ≤ 50 chars, but up to
  * 100 when it carries un-truncatable critical tokens (serial/key/address).
  */
+/**
+ * The injected index is level 2 of the memory hierarchy (profile/index →
+ * entry index → entry content → document). A keyPoint must therefore carry only
+ * high-density conclusions that tell the model WHICH entry to read next — never
+ * the document location, which belongs to the entry itself (level 3).
+ */
+export function stripPointersFromKeyPoint(text) {
+  let out = String(text ?? '')
+  // "细节见 <path>" / "详见过程档案" / "参见 UPGRADE.md" and friends.
+  out = out.replace(/[，；,;、]?\s*(?:详情|细节)?(?:见|参见|详见|另见)\s*[：:]?\s*[^，；。;,、)）]*(?:\.md|过程档案|档案|文档|记忆|会话记忆)[^，；。;,、)）]*/gu, '')
+  out = out.replace(/[，；,;、]?\s*(?:详情|细节|详见|参见|另见|请见)\s*$/gu, '')
+  // Home-relative and absolute paths; a bare "/" only counts with ≥2 segments,
+  // so identifiers such as "A/B" survive.
+  out = out.replace(/(?:~\/|\/Users\/|\/(?:[A-Za-z0-9._-]+\/)+)[A-Za-z0-9._\/-]*/gu, '')
+  out = out.replace(/[A-Za-z0-9._-]+\.md/gu, '')
+  return out
+    .replace(/(?:[，；,;、]\s*){2,}/gu, '，')
+    .replace(/[，；,;、\s]+$/u, '')
+    .replace(/\s{2,}/gu, ' ')
+    .trim()
+}
+
 function normalizeKeyPoint(rawKeyPoint, sourceContent) {
   const base = typeof rawKeyPoint === 'string' && rawKeyPoint.trim().length > 0
     ? rawKeyPoint.trim()
     : (typeof sourceContent === 'string' ? sourceContent.trim() : '')
   if (!base) return ''
-  const cap = hasCriticalToken(base) ? GLOBAL_KEY_POINT_CRITICAL_MAX : GLOBAL_KEY_POINT_MAX
-  return truncateChars(base, cap)
+  const dense = stripPointersFromKeyPoint(base)
+  if (dense.length === 0) return truncateChars(base, GLOBAL_KEY_POINT_MAX)
+  const cap = hasCriticalToken(dense) ? GLOBAL_KEY_POINT_CRITICAL_MAX : GLOBAL_KEY_POINT_MAX
+  return truncateChars(dense, cap)
 }
 
 /**
@@ -2882,6 +2906,7 @@ export const SESSION_CONSOLIDATION_INSTRUCTION = [
   '5. 目标：字符数降到原来的 40% 以下，同时保持可读（读者能只看这一条就知道该会话的结论与去哪儿查细节）。',
   '6. **过程档案指针必须保留**：若材料中出现「过程档案」段落（形如 【过程档案】<路径>），结果中必须原样保留其路径，并写成"记忆不足以解决问题时进一步读取该文档"的引导句；不得因为压缩而删掉它。',
   '7. keyPoint 是给"全局索引"用的整段摘要，要与 content 保持一致：目标 ≤50 字；**含路径/命令/版本号等关键标识时可到 100 字**（插件按标识自动放宽）。',
+  '7b. **keyPoint 只写高信息浓度的结论，用来让读者知道"该不该去读这一条记忆"**：不写文档位置、不写"细节见 X"、不写绝对路径（插件也会自动剥离）——文档位置放在 content 里。',
   '8. **不得在词中间截断** keyPoint（例如"terminal schedu"、"（清 13"）：宁可写一句更短的完整话；标识与结论不能同时放下时，保留标识并省略铺陈。',
 ].join('\n')
 
