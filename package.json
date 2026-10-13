@@ -1,6 +1,6 @@
 {
   "name": "dsh-structured-memory",
-  "version": "2.19.0",
+  "version": "2.19.1",
   "description": "Persistent cross-session memory for DSH: user profile + global compact index (runtime-context injected, change-triggered) + on-demand session memories, FTS5 search, auto backup, read-only memory for subagents, and a Plugins-page editor for the profile and global index.",
   "license": "MIT",
   "type": "module",

@@ -84,10 +84,16 @@ const INDEX_KEY_POINT_CHARS = 24
 const SESSION_MEMORY_MAX_CHARS = 16000
 /** A forked session writes into its lineage's memory unless this is turned off. */
 const DEFAULT_INHERIT_FORK_MEMORY = true
+/**
+ * Content rule for the session tier: the injected tiers stay small, and every
+ * session memory is retrieved later at the cost of a recall — so it holds
+ * conclusions and pointers, never the process that produced them.
+ */
+export const SAVE_MEMORY_CONTENT_RULE = "CONTENT RULE: this session keeps ONE memory, and that memory is a durable reference — keep it to conclusions, current state, trade-offs that cannot be re-derived, coordinates (paths, commands, numbers) and a pointer to where the process record lives (a project document or repository file). Process narrative, measured figures, pitfall stories, changelogs and commit hashes belong in that document, NOT here; write the pointer once instead of copying the detail." 
 /* ------------------------- transfer (export / import) -------------------- */
 const TRANSFER_PATH = '/api/dsh-memory-transfer'
 const TRANSFER_DIR = 'transfer'
-const PLUGIN_VERSION = '2.19.0'
+const PLUGIN_VERSION = '2.19.1'
 const EXPORT_KIND = 'dsh-structured-memory-export'
 const EXPORT_FORMAT = 1
 const TRANSFER_MAX_BYTES = 5 * 1024 * 1024
@@ -997,7 +1003,7 @@ function setupTools(ctx, config) {
 
   const saveTool = defineTool({
     name: 'save_memory',
-    description: "Save a long-term memory that should persist across future sessions. The CURRENT session keeps exactly ONE memory: this call REWRITES that single memory (appending the new facts after deduplication) rather than creating an additional entry, and a compact global entry is maintained for the session. Call it again in the same session whenever new durable facts appear — nothing is duplicated and nothing is lost. CALL THIS TOOL ONLY WHEN ONE OF THESE EVENTS HAS ACTUALLY OCCURRED, and pass the matching trigger: 'user-request' — the user explicitly asked to remember something (记住/记一下/记下来/存一下/别忘了); 'acceptance' — the user explicitly accepted a deliverable (可以了/没问题/已生效/通过); 'decision' — this session settled a trade-off that cannot be re-derived from the repository, the docs, or the conversation; 'correction' — the user corrected an existing memory. DO NOT CALL IT because you are considering whether something is worth remembering, for intermediate progress, for unfinished TODOs, for content already readable in the repository/docs/context, or for unverified guesses; an explicit user request outranks that exclusion list. For 'acceptance'/'decision'/'correction' ALSO pass evidence — a verbatim user quote, or a verifiable artifact (path, command, hash, number); if no evidence can be cited, do not save. Provide keyPoint: an ultra-compact one-line summary (default ≤ 50 characters, the shorter the better without ambiguity; may extend to 100 characters only when it must keep un-truncatable tokens like serial numbers, keys, or addresses intact). PROFILES: while saving, judge whether the memory also conveys stable user-profile information (identity, work role, personal context, technical stack, communication style). If so, ALSO pass profileUpdate (one concise profile point) and profileSection (identity | work | personal | technical | style) so the global user profile stays current. Delegated subagents have READ-ONLY memory access — the delegating agent owns the write.",
+    description: "Save a long-term memory that should persist across future sessions. The CURRENT session keeps exactly ONE memory: this call REWRITES that single memory (appending the new facts after deduplication) rather than creating an additional entry, and a compact global entry is maintained for the session. Call it again in the same session whenever new durable facts appear — nothing is duplicated and nothing is lost. CALL THIS TOOL ONLY WHEN ONE OF THESE EVENTS HAS ACTUALLY OCCURRED, and pass the matching trigger: 'user-request' — the user explicitly asked to remember something (记住/记一下/记下来/存一下/别忘了); 'acceptance' — the user explicitly accepted a deliverable (可以了/没问题/已生效/通过); 'decision' — this session settled a trade-off that cannot be re-derived from the repository, the docs, or the conversation; 'correction' — the user corrected an existing memory. DO NOT CALL IT because you are considering whether something is worth remembering, for intermediate progress, for unfinished TODOs, for content already readable in the repository/docs/context, or for unverified guesses; an explicit user request outranks that exclusion list. For 'acceptance'/'decision'/'correction' ALSO pass evidence — a verbatim user quote, or a verifiable artifact (path, command, hash, number); if no evidence can be cited, do not save. Provide keyPoint: an ultra-compact one-line summary (default ≤ 50 characters, the shorter the better without ambiguity; may extend to 100 characters only when it must keep un-truncatable tokens like serial numbers, keys, or addresses intact). PROFILES: while saving, judge whether the memory also conveys stable user-profile information (identity, work role, personal context, technical stack, communication style). If so, ALSO pass profileUpdate (one concise profile point) and profileSection (identity | work | personal | technical | style) so the global user profile stays current. Delegated subagents have READ-ONLY memory access — the delegating agent owns the write. ${SAVE_MEMORY_CONTENT_RULE}",
     parameters: {
       content: { type: 'string', required: true, description: "The full memory content to remember, in the user's own terms." },
       trigger: { type: 'string', required: true, description: "Why this save is happening — the occurred event: 'user-request' | 'acceptance' | 'decision' | 'correction'. Required; any other value is rejected." },
@@ -2849,7 +2855,7 @@ async function consolidationCatalog(webCtx, provider) {
   return { ok: true, providers, provider, models: rows }
 }
 
-const SESSION_CONSOLIDATION_INSTRUCTION = [
+export const SESSION_CONSOLIDATION_INSTRUCTION = [
   '下面是 dsh-memory 某个会话的**全部记忆**。请把它们**合成一条**记忆，输出 JSON：',
   '{"content":"...","category":"...","keyPoint":"≤50字的整段摘要"}',
   '规则：',
@@ -2857,8 +2863,10 @@ const SESSION_CONSOLIDATION_INSTRUCTION = [
   '2. 删除重复表述；**删除已被后续记忆推翻的内容**（同一事实以最新的为准）；删除已失效的做法、临时状态与过时结论。',
   '   被推翻的旧值要**彻底删除**，不要写"此前误记为…/曾用…"这类沿革说明——它们属于过时信息，没有保留价值。',
   '3. 保留所有仍然有效的路径、文件名、命令、URL、哈希、编号、数字、专有名词；只做合并与取舍，不新增事实、不做推断。',
-  '4. 目标：字符数降到原来的 60% 以下，同时保持可读（读者应能从这一条里看懂该会话的结论）。',
-  '5. keyPoint 是给"全局索引"用的整段摘要（不超过 50 字），要与 content 保持一致。',
+  '4. **内容分工**：只保留结论、当前状态、不可从仓库或文档反推的取舍、坐标（路径/命令/编号/版本号）与**指针**（过程档案的位置）；',
+  '   **优先删除**过程性叙述、实测数字、踩坑经过、沿革说明与提交哈希——它们属于项目文档，不属于记忆。',
+  '5. 目标：字符数降到原来的 40% 以下，同时保持可读（读者能只看这一条就知道该会话的结论与去哪儿查细节）。',
+  '6. keyPoint 是给"全局索引"用的整段摘要（不超过 50 字），要与 content 保持一致。',
 ].join('\n')
 
 /**
