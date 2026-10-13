@@ -78,6 +78,8 @@ DSH 跨会话记忆插件。把"每次都要用的信息"与"偶尔才要查的�
 | 对话命令 | `/dream`：生成建议 / 应用 / 丢弃 / 查看状态 |
 | 插件页 | 侧栏「插件 → 本插件 → 配置」四个页签：用户画像、全局索引、注入控制、会话记忆（含整理与校验） |
 | 一致性自检 | 关联、空会话、重复条目等多类巡检与幂等修复 |
+| 导出 / 导入 | 打包为带校验和的 JSON bundle（写入 `memory/transfer/`）；导入前预检、默认合并、写前快照、可回滚 |
+| 会话血缘 | fork 出的会话写入其血缘会话的记忆，**不新增条目**；跨机导入的记忆标"待匹配"但不影响读取 |
 | 自动备份 | 按间隔备份 `profile.json` / `global.json` / `sessions/`，超期轮换 |
 | 子 agent 只读 | 子 agent 可检索但不可写入，避免与父 agent 并发丢更新 |
 | 并发安全 | 全局索引读-改-写串行化 |
@@ -126,6 +128,29 @@ DSH 跨会话记忆插件。把"每次都要用的信息"与"偶尔才要查的�
 
 命令沿用**插件页保存的整理模型**，插件不会自行挑模型；未配置时返回错误提示。
 
+### 导出与导入（迁移 / 备份 / 合库）
+
+```bash
+# 导出：默认全量（画像 + 索引 + 全部会话），也可按会话 / 关键词 / 分类裁剪
+node tools/memory-transfer.mjs export
+node tools/memory-transfer.mjs export --session <sessionId> --no-profile
+
+node tools/memory-transfer.mjs list                    # 查看交换目录
+node tools/memory-transfer.mjs preview <file>          # 预检：将新增/合并/跳过/拒绝什么（不写数据）
+node tools/memory-transfer.mjs import  <file> --yes    # 确认后写入（自动快照）
+node tools/memory-transfer.mjs rollback <snapshot>     # 需要时整体回滚
+```
+
+交换目录固定为 `$DSH_HOME/memory/transfer/`：导出写到这里，导入只从这里读，不接受任意路径。
+
+三条硬规则：
+
+1. **导出单元是 `(索引条目, 会话记忆)` 原子对**——索引条目由选中的会话派生，不存在"只有索引、没有记忆"的包；
+2. **导入以会话文件为准**：缺条目自动补建；包里出现无对应会话的条目则**拒绝并列入报告**，绝不制造孤儿；
+3. **写前快照 + 契约校验**：写入 `memory-backup/import-<ts>/`（含 manifest），完成后校验"缺条目 0 / 孤儿 0"；同一 bundle 重复导入是幂等的。
+
+导入已存在的会话时默认**合并**（视作一次保存追加进那条记忆，去重、超上限则拒绝并报告），可用 `--on-existing skip|replace` 改变；`--remap` 让导入的会话用新 id 并存、原 id 记入 `origin.originSessionId`。
+
 ### 数据位置
 
 `$DSH_HOME/memory/`（通常 `~/.dsh/memory/`）：
@@ -136,7 +161,8 @@ DSH 跨会话记忆插件。把"每次都要用的信息"与"偶尔才要查的�
 | `global.json` | 全局索引（每会话一条） |
 | `sessions/<sessionId>.json` | 各会话记忆（每会话一条） |
 | `memory.db` | 派生 FTS5 索引，**不备份**，可随时重建 |
-| `memory-backup/` | 自动备份与整理前快照 |
+| `memory-backup/` | 自动备份、整理前快照、导入前快照（含 manifest，可回滚） |
+| `transfer/` | 导出/导入交换目录（导出写、导入读） |
 
 ### 运行要求
 

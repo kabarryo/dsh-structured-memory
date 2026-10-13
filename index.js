@@ -57,7 +57,7 @@
  * @module dsh-memory
  */
 
-import { mkdir, readFile, writeFile, rename, readdir, copyFile, rm } from 'node:fs/promises'
+import { mkdir, readFile, writeFile, rename, readdir, copyFile, rm, stat } from 'node:fs/promises'
 import { readFileSync, statSync, existsSync } from 'node:fs'
 import { dirname, resolve, join } from 'node:path'
 import { homedir, tmpdir } from 'node:os'
@@ -81,6 +81,129 @@ const DEFAULT_RECALL_LIMIT = 50
 const INDEX_KEY_POINT_CHARS = 24
 /** Hard ceiling for a session's single memory, so a save can never grow it forever. */
 const SESSION_MEMORY_MAX_CHARS = 16000
+/** A forked session writes into its lineage's memory unless this is turned off. */
+const DEFAULT_INHERIT_FORK_MEMORY = true
+/* ------------------------- transfer (export / import) -------------------- */
+const TRANSFER_PATH = '/api/dsh-memory-transfer'
+const TRANSFER_DIR = 'transfer'
+const PLUGIN_VERSION = '2.17.0'
+const EXPORT_KIND = 'dsh-structured-memory-export'
+const EXPORT_FORMAT = 1
+const TRANSFER_MAX_BYTES = 5 * 1024 * 1024
+
+function transferDirOf(config) {
+  return join(memoryRootOf(config), TRANSFER_DIR)
+}
+
+/** Deterministic serialization: the checksum must not depend on key order. */
+function stableStringify(value) {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value ?? null)
+  if (Array.isArray(value)) return `[${value.map((item) => stableStringify(item)).join(',')}]`
+  const keys = Object.keys(value).filter((key) => value[key] !== undefined).sort()
+  return `{${keys.map((key) => `${JSON.stringify(key)}:${stableStringify(value[key])}`).join(',')}}`
+}
+
+function exportChecksum(payload) {
+  return `sha256:${createHash('sha256').update(stableStringify(payload)).digest('hex')}`
+}
+
+/** Assemble the machine-readable bundle. `sessions` is the主体; entries derive from it. */
+export function buildExportBundle({ version, profile, entries, sessions, options, at }) {
+  const payload = {
+    kind: EXPORT_KIND,
+    format: EXPORT_FORMAT,
+    exportedAt: new Date(at).toISOString(),
+    source: { plugin: name, version, memoryRoot: 'memory' },
+    options,
+    counts: {
+      profilePoints: profile === null ? 0 : PROFILE_SECTIONS.reduce((total, section) => total + (profile.sections[section] ?? []).length, 0),
+      globalEntries: entries.length,
+      sessions: sessions.length,
+      memories: sessions.reduce((total, session) => total + session.memories.length, 0),
+    },
+    profile: profile === null ? null : { sections: profile.sections, updatedAt: profile.updatedAt ?? null },
+    global: entries.map((entry) => ({
+      id: entry.id,
+      sessionId: entry.sessionId,
+      title: entry.title ?? '',
+      keyPoints: entry.keyPoints ?? '',
+      category: entry.category ?? DEFAULT_CATEGORY,
+      lastActivity: entry.lastActivity ?? null,
+    })),
+    sessions: sessions.map((session) => ({
+      sessionId: session.sessionId,
+      title: session.title ?? null,
+      origin: isRecord(session.origin) ? session.origin : null,
+      memories: session.memories.map((memory) => ({
+        id: String(memory.id),
+        content: String(memory.content ?? ''),
+        category: memory.category ?? DEFAULT_CATEGORY,
+        createdAt: Number.isFinite(memory.createdAt) ? memory.createdAt : Date.now(),
+        ...(Number.isFinite(memory.updatedAt) ? { updatedAt: memory.updatedAt } : {}),
+        ...(Number.isFinite(memory.mergedCount) ? { mergedCount: memory.mergedCount } : {}),
+      })),
+    })),
+  }
+  return { ...payload, checksum: exportChecksum(payload) }
+}
+
+/** Validate a bundle: kind, format, checksum, shape. Never trusts the file. */
+export function parseExportBundle(text) {
+  let parsed
+  try {
+    parsed = JSON.parse(text)
+  } catch (error) {
+    return { ok: false, code: 'unparsable', message: `不是合法 JSON：${error instanceof Error ? error.message : String(error)}` }
+  }
+  if (!isRecord(parsed)) return { ok: false, code: 'malformed', message: '顶层不是对象' }
+  if (parsed.kind !== EXPORT_KIND) return { ok: false, code: 'wrong-kind', message: `kind 不是 ${EXPORT_KIND}（若为仅索引预览格式，导入端拒绝）` }
+  if (parsed.format !== EXPORT_FORMAT) return { ok: false, code: 'wrong-format', message: `format=${String(parsed.format)}，本版只接受 ${EXPORT_FORMAT}` }
+  const { checksum, ...payload } = parsed
+  if (typeof checksum !== 'string' || checksum !== exportChecksum(payload)) {
+    return { ok: false, code: 'checksum-mismatch', message: '校验和不匹配：文件可能被截断或手工修改' }
+  }
+  if (!Array.isArray(parsed.sessions) || !Array.isArray(parsed.global)) return { ok: false, code: 'malformed', message: 'global / sessions 必须是数组' }
+  return { ok: true, bundle: parsed }
+}
+
+/**
+ * Import plan: what would change. Pure input → decision, so it can be shown as a
+ * dry-run before anything is written.
+ */
+export function planImport({ bundle, targetProfile, targetSessionIds, onExisting }) {
+  const profileAdds = []
+  const profileSkips = []
+  if (isRecord(bundle.profile) && isRecord(bundle.profile.sections)) {
+    for (const section of PROFILE_SECTIONS) {
+      const points = Array.isArray(bundle.profile.sections[section]) ? bundle.profile.sections[section] : []
+      const existing = targetProfile?.sections?.[section] ?? []
+      for (const point of points) {
+        const text = String(point ?? '').trim()
+        if (text.length === 0) continue
+        if (profilePointCovered(existing, text)) profileSkips.push({ section, text })
+        else profileAdds.push({ section, text })
+      }
+    }
+  }
+  const bundleSessionIds = new Set(bundle.sessions.map((session) => session.sessionId))
+  const sessions = bundle.sessions.map((session) => ({
+    sessionId: session.sessionId,
+    memories: session.memories.length,
+    chars: session.memories.reduce((total, memory) => total + String(memory.content ?? '').length, 0),
+    mode: !targetSessionIds.has(session.sessionId)
+      ? 'create'
+      : onExisting === 'skip' ? 'skip' : onExisting === 'replace' ? 'replace' : 'merge',
+  }))
+  // Hard rule: an entry without its session in the same bundle can never be
+  // imported (it would become an orphan entry and break the 1:1 contract).
+  const rejectedEntries = bundle.global
+    .filter((entry) => typeof entry.sessionId !== 'string' || !bundleSessionIds.has(entry.sessionId))
+    .map((entry) => ({ id: entry.id, sessionId: entry.sessionId ?? null, title: entry.title ?? '' }))
+  const bundleEntrySessions = new Set(bundle.global.map((entry) => entry.sessionId))
+  const entriesToBuild = bundle.sessions.filter((session) => !bundleEntrySessions.has(session.sessionId)).map((session) => session.sessionId)
+  return { profileAdds, profileSkips, sessions, rejectedEntries, entriesToBuild }
+}
+
 const DEFAULT_MAX_PROFILE_POINTS = 100
 const DEFAULT_AUTO_BACKUP_MIN = 1440 // once per day
 const DEFAULT_BACKUP_RETAIN_DAYS = 7
@@ -122,6 +245,7 @@ export const Config = z.object({
   migration: z.boolean(),
   subagentMemoryReadOnly: z.boolean(),
   saveRequireEvidence: z.boolean(),
+  inheritForkMemory: z.boolean(),
   consolidationProvider: z.string().volatile(),
   consolidationModel: z.string().volatile(),
   consolidationReasoningEffort: z.string().volatile(),
@@ -856,7 +980,10 @@ function setupTools(ctx, config) {
       // v2.3: delegated subagents are read-only (no save, no delete).
       assertMemoryWritable(config, exec.agent, 'save_memory')
       rememberRoute(exec.agent)
-      const sessionId = exec.agent && exec.agent.id ? String(exec.agent.id) : null
+      const ownSessionId = exec.agent && exec.agent.id ? String(exec.agent.id) : null
+      // A fork writes into its lineage's memory so updates never spawn a new entry.
+      const sessionId = ownSessionId === null ? null : await resolveOwnerSessionId(config, exec.agent)
+      const headerParent = exec.agent?.session?.header?.parentSession ?? null
       const store = memoryRootOf(config)
       const content = String(args.content ?? '').trim()
       if (!content) throw new Error('save_memory: content is required')
@@ -891,6 +1018,12 @@ function setupTools(ctx, config) {
           summary: null,
           memories: [],
           updatedAt: null,
+        }
+        // Record this session's own lineage so descendants can walk up to us.
+        doc.origin = {
+          ...(isRecord(doc.origin) ? doc.origin : {}),
+          ...(typeof headerParent === 'string' && headerParent.length > 0 ? { parentSession: headerParent } : {}),
+          lastWriter: ownSessionId,
         }
         // v2.16: ONE memory per session — a save rewrites that single memory
         // (deduplicated append) instead of appending a new list item. v2.4 gate 3
@@ -1669,6 +1802,9 @@ async function auditMemoryLinks(config) {
       .map((entry) => ({ id: entry.id, sessionId: entry.sessionId ?? null, title: entry.title ?? '' })),
     emptySessions: sessions.filter((row) => row.count === 0).map((row) => row.sessionId),
     multiMemorySessions: sessions.filter((row) => row.count > 1).map((row) => ({ sessionId: row.sessionId, count: row.count })),
+    // Informational only: a dangling memory has no DSH conversation on this
+    // machine, which is normal for imported memories and is NOT an anomaly.
+    sessionLinks: sessionLinkScan ?? { at: null, dshSessions: 0, memories: sessions.length, linked: [], dangling: [] },
     duplicateEntries: [...bySession.entries()].filter(([, list]) => list.length > 1).map(([sessionId, list]) => ({ sessionId, ids: list.map((entry) => entry.id) })),
   }
 }
@@ -1746,7 +1882,333 @@ async function repairMemoryLinks(config) {
   return { ok: true, actions, before: audit }
 }
 
+/**
+ * Resolve which session's memory file this agent's saves belong to.
+ *
+ * A forked session inherits the transcript prefix of its parent (DSH exposes
+ * `header.parentSession`), so it is the *same conversation*: attributing its
+ * saves to the lineage's topmost known session keeps one memory per conversation
+ * instead of a fresh entry per fork. The chain is walked through each ancestor's
+ * recorded `origin.parentSession`, and stops at the first ancestor without a
+ * record — that ancestor still becomes the owner, so siblings converge.
+ */
+export async function resolveOwnerSessionId(config, agent) {
+  const own = agent !== undefined && agent !== null && agent.id !== undefined && agent.id !== null ? String(agent.id) : null
+  if (own === null) return null
+  if ((config.inheritForkMemory ?? DEFAULT_INHERIT_FORK_MEMORY) !== true) return own
+  const headerParent = agent?.session?.header?.parentSession
+  if (typeof headerParent !== 'string' || headerParent.length === 0) return own
+  const seen = new Set([own])
+  let owner = headerParent
+  for (let depth = 0; depth < 16; depth++) {
+    if (seen.has(owner)) break
+    seen.add(owner)
+    const doc = await readSessionMemory(config, owner)
+    const up = doc?.origin?.parentSession
+    if (typeof up !== 'string' || up.length === 0) break
+    owner = up
+  }
+  return owner
+}
+
+/** Every session id DSH has a log directory for, on this machine. */
+async function listDshSessionIds(config) {
+  const ids = new Set()
+  const root = join(dirname(memoryRootOf(config)), 'sessions')
+  let slugs = []
+  try {
+    slugs = await readdir(root)
+  } catch {
+    return ids
+  }
+  for (const slug of slugs) {
+    let entries = []
+    try {
+      entries = await readdir(join(root, slug))
+    } catch {
+      continue
+    }
+    for (const name of entries) if (name.startsWith('session-')) ids.add(name)
+  }
+  return ids
+}
+
+/**
+ * Link scan: a memory is "linked" when DSH still has the conversation it came
+ * from, and "dangling" when it does not (imported from another machine, or the
+ * log was pruned). Dangling is a normal state — the memory stays fully readable
+ * and injected; the scan only feeds the editor, the report, and the doctor view
+ * (which must never treat dangling as an anomaly: there is no plugin file missing).
+ */
+export async function scanSessionLinks(config) {
+  const memoryIds = await listSessionFiles(config)
+  const dshIds = await listDshSessionIds(config)
+  const linked = []
+  const dangling = []
+  for (const id of memoryIds) (dshIds.has(id) ? linked : dangling).push(id)
+  sessionLinkScan = {
+    at: Date.now(),
+    dshSessions: dshIds.size,
+    memories: memoryIds.length,
+    linked,
+    dangling,
+  }
+  return sessionLinkScan
+}
+
 /** Compact per-session rows for the editor's session list. */
+/** Collect the export material for the requested scope. */
+async function collectExportScope(config, options) {
+  const entries = await readGlobal(config)
+  let ids = await listSessionFiles(config)
+  if (Array.isArray(options.sessionIds) && options.sessionIds.length > 0) {
+    const wanted = new Set(options.sessionIds.map((id) => safeSessionId(id)))
+    ids = ids.filter((id) => wanted.has(id))
+  }
+  const sessions = []
+  for (const id of ids) {
+    const doc = await readSessionMemory(config, id)
+    if (doc === null) continue
+    const memories = Array.isArray(doc.memories) ? doc.memories : []
+    if (memories.length === 0) continue
+    if (typeof options.category === 'string' && options.category.length > 0
+      && !memories.some((memory) => (memory.category ?? DEFAULT_CATEGORY) === options.category)) continue
+    if (Number.isFinite(options.since) && Number(doc.updatedAt ?? 0) < options.since) continue
+    if (typeof options.query === 'string' && options.query.trim().length > 0) {
+      const needle = options.query.trim().toLowerCase()
+      if (!memories.some((memory) => String(memory.content ?? '').toLowerCase().includes(needle))) continue
+    }
+    sessions.push({ sessionId: id, title: doc.title ?? null, origin: doc.origin ?? null, memories })
+  }
+  // Hard rule: entries are derived from the selected sessions, never chosen alone.
+  const selected = new Set(sessions.map((session) => session.sessionId))
+  return {
+    profile: options.profile === false ? null : await readProfile(config),
+    entries: entries.filter((entry) => selected.has(entry.sessionId)),
+    sessions,
+  }
+}
+
+/** Files sitting in the transfer directory (the only path import will read). */
+async function listTransferFiles(config) {
+  const dir = transferDirOf(config)
+  let names = []
+  try {
+    names = await readdir(dir)
+  } catch {
+    return []
+  }
+  const rows = []
+  for (const fileName of names.filter((entry) => entry.endsWith('.json')).sort()) {
+    try {
+      const info = await stat(join(dir, fileName))
+      rows.push({ file: fileName, size: info.size, mtime: info.mtimeMs })
+    } catch {
+      continue
+    }
+  }
+  return rows
+}
+
+/** Read one transfer file, enforcing the name shape and the size ceiling. */
+async function readTransferFile(config, fileName) {
+  const safe = String(fileName ?? '').replace(/[^A-Za-z0-9._-]/g, '')
+  if (!safe.endsWith('.json')) throw new Error('only .json bundles can be imported')
+  const path = join(transferDirOf(config), safe)
+  const info = await stat(path)
+  if (info.size > TRANSFER_MAX_BYTES) throw new Error(`bundle too large: ${info.size} bytes > ${TRANSFER_MAX_BYTES}`)
+  return { fileName: safe, path, text: await readFile(path, 'utf8') }
+}
+
+/**
+ * Snapshot everything an import may touch, with a manifest that also records
+ * which targets did not exist yet (so rollback can delete them again).
+ */
+async function snapshotForImport(config, sessionIds) {
+  const root = memoryRootOf(config)
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-')
+  const dir = join(root, 'memory-backup', `import-${stamp}`)
+  await mkdir(dir, { recursive: true })
+  const files = []
+  const record = async (relPath, backupName) => {
+    try {
+      await copyFile(join(root, relPath), join(dir, backupName))
+      files.push({ relPath, backupName, state: 'saved' })
+    } catch {
+      files.push({ relPath, backupName, state: 'absent' })
+    }
+  }
+  await record('profile.json', 'profile.json')
+  await record('global.json', 'global.json')
+  for (const id of sessionIds) await record(join('sessions', `${safeSessionId(id)}.json`), `${safeSessionId(id)}.json`)
+  await writeFile(join(dir, 'manifest.json'), JSON.stringify({ kind: 'dsh-memory-import-snapshot', at: Date.now(), files }, null, 2))
+  return `import-${stamp}`
+}
+
+/** Restore an import snapshot: put saved files back, delete the ones it created. */
+async function rollbackImportSnapshot(config, snapshotName) {
+  const root = memoryRootOf(config)
+  const safe = String(snapshotName ?? '').replace(/[^A-Za-z0-9._-]/g, '')
+  const dir = join(root, 'memory-backup', safe)
+  const manifest = JSON.parse(await readFile(join(dir, 'manifest.json'), 'utf8'))
+  const restored = []
+  const removed = []
+  for (const entry of manifest.files ?? []) {
+    const target = join(root, entry.relPath)
+    const sessionId = entry.relPath.startsWith('sessions/') ? entry.relPath.slice('sessions/'.length).replace(/\.json$/, '') : null
+    if (entry.state === 'saved') {
+      await mkdir(dirname(target), { recursive: true })
+      await copyFile(join(dir, entry.backupName), target)
+      restored.push(entry.relPath)
+      if (sessionId !== null) {
+        await indexRemove(config, { sessionId })
+        const doc = await readSessionMemory(config, sessionId)
+        for (const memory of doc?.memories ?? []) {
+          await indexUpsert(config, { sessionId, memoryId: memory.id, category: memory.category, content: memory.content, createdAt: memory.createdAt })
+        }
+      }
+    } else {
+      await rm(target, { force: true })
+      removed.push(entry.relPath)
+      if (sessionId !== null) {
+        await indexRemove(config, { sessionId })
+        const entries = await readGlobal(config)
+        const next = entries.filter((entry) => entry.sessionId !== sessionId)
+        if (next.length !== entries.length) await writeGlobal(config, next)
+      }
+    }
+  }
+  return { ok: true, snapshot: safe, restored, removed }
+}
+
+/** Apply an import plan. The caller holds the global lock. */
+async function applyImport(config, bundle, plan, options) {
+  const touched = new Set()
+  const report = {
+    created: [], merged: [], skipped: [], replaced: [], rejected: [],
+    profileAdded: 0, profileSkipped: plan.profileSkips.length, profileReplaced: false,
+    entriesBuilt: [], entriesRejected: plan.rejectedEntries, remapped: [],
+  }
+  const snapshot = await snapshotForImport(config, bundle.sessions.map((session) => session.sessionId))
+
+  if (plan.profileAdds.length > 0 || options.replaceProfile === true) {
+    const profile = await readProfile(config)
+    if (options.replaceProfile === true && isRecord(bundle.profile) && isRecord(bundle.profile.sections)) {
+      for (const section of PROFILE_SECTIONS) {
+        profile.sections[section] = (Array.isArray(bundle.profile.sections[section]) ? bundle.profile.sections[section] : [])
+          .map((point) => String(point).trim()).filter(Boolean).slice(0, 200)
+      }
+      report.profileReplaced = true
+    } else {
+      for (const { section, text } of plan.profileAdds) {
+        if (!profilePointCovered(profile.sections[section], text)) profile.sections[section].push(text)
+      }
+      report.profileAdded = plan.profileAdds.length
+    }
+    profile.updatedAt = Date.now()
+    await writeProfile(config, profile)
+  }
+
+  const bundleEntryFor = new Map(bundle.global.map((entry) => [entry.sessionId, entry]))
+  for (const sessionPlan of plan.sessions) {
+    const source = bundle.sessions.find((session) => session.sessionId === sessionPlan.sessionId)
+    if (source === undefined) continue
+    const incoming = {
+      sessionId: source.sessionId,
+      title: source.title ?? null,
+      summary: null,
+      memories: (Array.isArray(source.memories) ? source.memories : []).map((memory) => ({
+        id: String(memory.id),
+        content: String(memory.content ?? ''),
+        category: memory.category ?? DEFAULT_CATEGORY,
+        createdAt: Number.isFinite(memory.createdAt) ? memory.createdAt : Date.now(),
+      })),
+      updatedAt: Date.now(),
+      ...(isRecord(source.origin) ? { origin: source.origin } : {}),
+    }
+    if (incoming.memories.length === 0) continue
+
+    const remapped = options.remapSessions === true && sessionPlan.mode !== 'create'
+    const targetId = remapped ? `session-imported-${randomUUID().slice(0, 8)}` : source.sessionId
+    const mode = remapped ? 'create' : sessionPlan.mode
+    if (remapped) report.remapped.push({ from: source.sessionId, to: targetId })
+
+    if (mode === 'skip') {
+      report.skipped.push({ sessionId: targetId, memories: incoming.memories.length, reason: 'on-existing=skip' })
+      continue
+    }
+    if (mode === 'create' || mode === 'replace') {
+      const doc = { ...incoming, sessionId: targetId }
+      if (remapped) doc.origin = { ...(isRecord(doc.origin) ? doc.origin : {}), originSessionId: source.sessionId }
+      collapseSessionMemories(doc) // one memory per session, also for incoming bundles
+      await writeSessionMemory(config, targetId, doc)
+      touched.add(targetId)
+      if (mode === 'replace') report.replaced.push({ sessionId: targetId })
+      else report.created.push({ sessionId: targetId, memories: doc.memories.length })
+      continue
+    }
+    // merge: imported content is applied like one more save to that session.
+    const doc = (await readSessionMemory(config, targetId)) ?? { sessionId: targetId, title: null, summary: null, memories: [], updatedAt: null }
+    const bytesOf = (value) => value.memories.reduce((total, memory) => total + Array.from(String(memory.content ?? '')).length, 0)
+    const bytesBefore = bytesOf(doc)
+    let outcome = { merged: false, created: false, reason: 'empty' }
+    let overflow = null
+    for (const memory of incoming.memories) {
+      outcome = mergeIntoSessionMemory(doc, String(memory.content ?? ''), memory.category ?? DEFAULT_CATEGORY)
+      if (outcome.merged !== true && outcome.created !== true) {
+        overflow = outcome.reason ?? 'no-change'
+        break
+      }
+    }
+    if (outcome.merged === true || outcome.created === true) {
+      if (doc.title === null && typeof source.title === 'string' && source.title.length > 0) doc.title = source.title
+      await writeSessionMemory(config, targetId, doc)
+      touched.add(targetId)
+      report.merged.push({ sessionId: targetId, bytesBefore, bytesAfter: bytesOf(doc) })
+    } else if (outcome.reason !== undefined && /would reach/.test(String(outcome.reason))) {
+      report.rejected.push({ sessionId: targetId, reason: outcome.reason, overflow })
+    } else {
+      report.skipped.push({ sessionId: targetId, memories: incoming.memories.length, reason: String(outcome.reason ?? 'no-change') })
+    }
+  }
+
+  for (const sessionId of touched) {
+    await indexRemove(config, { sessionId })
+    const doc = await readSessionMemory(config, sessionId)
+    for (const memory of doc?.memories ?? []) {
+      await indexUpsert(config, { sessionId, memoryId: memory.id, category: memory.category, content: memory.content, createdAt: memory.createdAt })
+    }
+    const originId = report.remapped.find((row) => row.to === sessionId)?.from ?? sessionId
+    const bundleEntry = bundleEntryFor.get(originId)
+    await upsertSessionEntryLocked(config, sessionId, {
+      keyPoint: typeof bundleEntry?.keyPoints === 'string' && bundleEntry.keyPoints.length > 0 ? bundleEntry.keyPoints : undefined,
+      title: typeof doc?.title === 'string' && doc.title.length > 0 ? doc.title : (typeof bundleEntry?.title === 'string' ? bundleEntry.title : undefined),
+      category: doc?.memories?.[0]?.category ?? bundleEntry?.category,
+      lastActivity: doc?.updatedAt,
+    })
+  }
+  for (const sessionId of plan.entriesToBuild) {
+    if (touched.has(sessionId)) continue
+    const doc = await readSessionMemory(config, sessionId)
+    const first = doc?.memories?.[0]
+    if (doc === null || first === undefined) continue
+    await upsertSessionEntryLocked(config, sessionId, {
+      keyPoint: normalizeKeyPoint(undefined, first.content),
+      title: typeof doc.title === 'string' && doc.title.length > 0 ? doc.title : undefined,
+      category: first.category,
+      lastActivity: doc.updatedAt,
+    })
+    report.entriesBuilt.push(sessionId)
+  }
+
+  const audit = await auditMemoryLinks(config)
+  return {
+    snapshot,
+    report,
+    audit: { missingEntries: audit.missingEntries.length, orphanEntries: audit.orphanEntries.length },
+  }
+}
+
 async function listSessionSummaries(config) {
   const rows = []
   for (const sessionId of await listSessionFiles(config)) {
@@ -2033,6 +2495,8 @@ let consolidationDraft = null
 let dreamCommandRegistered = false
 /** Most recent consolidation attempt (also the head of the persisted log). */
 let consolidationLastRun = null
+/** Last session-link scan (derived state; never persisted). */
+let sessionLinkScan = null
 /** Persisted run history, loaded lazily from `consolidation-log.json`. */
 let consolidationHistory = null
 let consolidationWriteChain = Promise.resolve()
@@ -2766,6 +3230,158 @@ function setupDreamCommand(ctx, config) {
 /* ------------------------- end /dream ---------------------------------- */
 
 /** Serve the editor bridge; absent web servers (headless) simply never inject. */
+/** Short human label for the exported scope, used in the file name. */
+function exportScopeLabel(options, material) {
+  if (options.profile === false && material.sessions.length === 0) return 'empty'
+  if (Array.isArray(options.sessionIds) && options.sessionIds.length > 0) return `sessions-${material.sessions.length}`
+  if (typeof options.query === 'string' && options.query.trim().length > 0) return `query-${material.sessions.length}`
+  if (typeof options.category === 'string' && options.category.length > 0) return `category-${material.sessions.length}`
+  if (options.profile === false) return `sessions-${material.sessions.length}`
+  return `all-${material.sessions.length}`
+}
+
+/**
+ * Transfer bridge: export writes a bundle into `memory/transfer/`, import reads
+ * only from there (no arbitrary paths), previews first, snapshots, then applies.
+ */
+function setupTransferBridge(ctx, config) {
+  if (typeof ctx.inject !== 'function') return
+  ctx.inject(['webServer'], (webCtx) => {
+    webCtx.effect(() => webCtx.webServer.register({
+      kind: 'exact',
+      path: TRANSFER_PATH,
+      handler: async (req, res) => {
+        if (!isLoopbackRequest(req)) {
+          sendBridgeJson(res, 403, { ok: false, code: 'loopback-only', message: 'loopback requests only' })
+          return
+        }
+        const query = new URL(req.url ?? '/', 'http://127.0.0.1').searchParams
+        try {
+          if (req.method === 'GET') {
+            const previewFile = query.get('preview')
+            if (previewFile !== null) {
+              const { fileName, text } = await readTransferFile(config, previewFile)
+              const parsed = parseExportBundle(text)
+              if (parsed.ok !== true) {
+                sendBridgeJson(res, 200, { ok: false, file: fileName, ...parsed })
+                return
+              }
+              const plan = planImport({
+                bundle: parsed.bundle,
+                targetProfile: await readProfile(config),
+                targetSessionIds: new Set(await listSessionFiles(config)),
+                onExisting: query.get('onExisting') ?? 'merge',
+              })
+              sendBridgeJson(res, 200, {
+                ok: true,
+                file: fileName,
+                dir: transferDirOf(config),
+                source: parsed.bundle.source,
+                exportedAt: parsed.bundle.exportedAt,
+                counts: parsed.bundle.counts,
+                checksum: parsed.bundle.checksum,
+                plan,
+              })
+              return
+            }
+            sendBridgeJson(res, 200, { ok: true, dir: transferDirOf(config), files: await listTransferFiles(config) })
+            return
+          }
+          if (req.method !== 'POST') {
+            sendBridgeJson(res, 405, { ok: false, code: 'method-not-allowed', message: `method not allowed: ${req.method ?? ''}` })
+            return
+          }
+          const body = await readBridgeBody(req)
+          if (body === undefined) {
+            sendBridgeJson(res, 400, { ok: false, code: 'malformed-body', message: 'malformed JSON body' })
+            return
+          }
+          const options = isRecord(body) ? body : {}
+
+          if (query.get('export') !== null) {
+            const material = await collectExportScope(config, options)
+            const at = Date.now()
+            const bundle = buildExportBundle({
+              version: PLUGIN_VERSION,
+              profile: material.profile,
+              entries: material.entries,
+              sessions: material.sessions,
+              options: {
+                profile: options.profile !== false,
+                sessionIds: Array.isArray(options.sessionIds) ? options.sessionIds.map((id) => safeSessionId(id)) : null,
+                category: typeof options.category === 'string' && options.category.length > 0 ? options.category : null,
+                since: Number.isFinite(options.since) ? options.since : null,
+                query: typeof options.query === 'string' && options.query.length > 0 ? options.query : null,
+              },
+              at,
+            })
+            const text = `${JSON.stringify(bundle, null, 2)}\n`
+            const bytes = Buffer.byteLength(text, 'utf8')
+            if (bytes > TRANSFER_MAX_BYTES) {
+              sendBridgeJson(res, 200, { ok: false, code: 'too-large', message: `bundle would be ${bytes} bytes > ${TRANSFER_MAX_BYTES}` })
+              return
+            }
+            const fileName = `memory-export-${new Date(at).toISOString().replace(/[:.]/g, '-')}-${exportScopeLabel(options, material)}.json`
+            await mkdir(transferDirOf(config), { recursive: true })
+            await writeFile(join(transferDirOf(config), fileName), text, { mode: 0o600 })
+            sendBridgeJson(res, 200, {
+              ok: true,
+              file: fileName,
+              path: join(transferDirOf(config), fileName),
+              bytes,
+              counts: bundle.counts,
+              checksum: bundle.checksum,
+            })
+            return
+          }
+
+          const importFile = query.get('import')
+          if (importFile !== null) {
+            if (options.confirm !== true) {
+              sendBridgeJson(res, 200, { ok: false, code: 'confirm-required', message: '导入需显式确认（confirm: true）；先用 ?preview=<file> 查看将发生的改动' })
+              return
+            }
+            const { fileName, text } = await readTransferFile(config, importFile)
+            const parsed = parseExportBundle(text)
+            if (parsed.ok !== true) {
+              sendBridgeJson(res, 200, { ok: false, file: fileName, ...parsed })
+              return
+            }
+            const result = await withGlobalLock(config, async () => {
+              const plan = planImport({
+                bundle: parsed.bundle,
+                targetProfile: await readProfile(config),
+                targetSessionIds: new Set(await listSessionFiles(config)),
+                onExisting: typeof options.onExisting === 'string' ? options.onExisting : 'merge',
+              })
+              return applyImport(config, parsed.bundle, plan, options)
+            })
+            void scanSessionLinks(config).catch(() => {})
+            sendBridgeJson(res, 200, { ok: true, file: fileName, ...result })
+            return
+          }
+
+          const rollbackName = query.get('rollback')
+          if (rollbackName !== null) {
+            const result = await withGlobalLock(config, () => rollbackImportSnapshot(config, rollbackName))
+            void scanSessionLinks(config).catch(() => {})
+            sendBridgeJson(res, 200, result)
+            return
+          }
+
+          sendBridgeJson(res, 400, {
+            ok: false,
+            code: 'bad-request',
+            message: 'use ?export=1, ?import=<file>, ?rollback=<snapshot>, ?list=1 or ?preview=<file>',
+          })
+        } catch (error) {
+          sendBridgeJson(res, 200, { ok: false, code: 'transfer-failed', message: error instanceof Error ? error.message : String(error) })
+        }
+      },
+    }), 'dsh-memory: transfer bridge')
+  })
+}
+
 function setupStoreBridge(ctx, config) {
   if (typeof ctx.inject !== 'function') return
   ctx.inject(['webServer'], (webCtx) => {
@@ -2859,6 +3475,11 @@ function setupStoreBridge(ctx, config) {
         }
         if (req.method === 'GET') {
           const query = new URL(req.url ?? '/', 'http://127.0.0.1').searchParams
+          if (query.get('sessionLinks') !== null || query.get('rescanLinks') !== null) {
+            const scan = query.get('rescanLinks') !== null ? await scanSessionLinks(config) : (sessionLinkScan ?? await scanSessionLinks(config))
+            sendBridgeJson(res, 200, { ok: true, sessionLinks: scan })
+            return
+          }
           if (query.get('doctor') !== null) {
             sendBridgeJson(res, 200, await auditMemoryLinks(config))
             return
@@ -2930,5 +3551,8 @@ export function apply(ctx, config = {}) {
   setupTools(ctx, config)
   setupInjection(ctx, config)
   setupStoreBridge(ctx, config)
+  setupTransferBridge(ctx, config)
   setupDreamCommand(ctx, config)
+  // Link scan once per plugin load (imports, pruned logs, new forks all settle here).
+  void scanSessionLinks(config).catch(() => {})
 }
