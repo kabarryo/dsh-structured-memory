@@ -135,13 +135,18 @@ DSH 跨会话记忆插件。把"每次都要用的信息"与"偶尔才要查的�
 node tools/memory-transfer.mjs export
 node tools/memory-transfer.mjs export --session <sessionId> --no-profile
 
+# 保存位置：默认写入交换目录；也可指定文件、指定目录，或导出后在访达中定位
+node tools/memory-transfer.mjs export --out ~/Desktop/mem.json
+node tools/memory-transfer.mjs export --dir ~/Downloads
+node tools/memory-transfer.mjs export --reveal
+
 node tools/memory-transfer.mjs list                    # 查看交换目录
 node tools/memory-transfer.mjs preview <file>          # 预检：将新增/合并/跳过/拒绝什么（不写数据）
 node tools/memory-transfer.mjs import  <file> --yes    # 确认后写入（自动快照）
 node tools/memory-transfer.mjs rollback <snapshot>     # 需要时整体回滚
 ```
 
-交换目录固定为 `$DSH_HOME/memory/transfer/`：导出写到这里，导入只从这里读，不接受任意路径。
+交换目录为 `$DSH_HOME/memory/transfer/`（**默认**落点）：导入可用相对文件名直接引用它。指定位置时路径须为绝对路径（支持 `~`）、以 `.json` 结尾、位于家目录或 `/tmp` 之内，且**默认不覆盖已存在文件**（加 `--overwrite` 才覆盖）——这样"导出到任意位置"与"不越界写文件"可以兼得。导入同样接受这些允许目录内的绝对路径。
 
 三条硬规则：
 

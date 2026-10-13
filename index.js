@@ -59,7 +59,8 @@
 
 import { mkdir, readFile, writeFile, rename, readdir, copyFile, rm, stat } from 'node:fs/promises'
 import { readFileSync, statSync, existsSync } from 'node:fs'
-import { dirname, resolve, join } from 'node:path'
+import { dirname, resolve, join, basename, sep } from 'node:path'
+import { execFile } from 'node:child_process'
 import { homedir, tmpdir } from 'node:os'
 import { randomUUID, createHash } from 'node:crypto'
 import z from '@deepseek-ai/schemastery'
@@ -86,13 +87,62 @@ const DEFAULT_INHERIT_FORK_MEMORY = true
 /* ------------------------- transfer (export / import) -------------------- */
 const TRANSFER_PATH = '/api/dsh-memory-transfer'
 const TRANSFER_DIR = 'transfer'
-const PLUGIN_VERSION = '2.17.0'
+const PLUGIN_VERSION = '2.17.1'
 const EXPORT_KIND = 'dsh-structured-memory-export'
 const EXPORT_FORMAT = 1
 const TRANSFER_MAX_BYTES = 5 * 1024 * 1024
 
 function transferDirOf(config) {
   return join(memoryRootOf(config), TRANSFER_DIR)
+}
+
+/**
+ * Roots the operator may read/write bundles from. The bridge is loopback-only,
+ * but "loopback" still means any local process, so paths are confined to the
+ * user's own home (plus the transfer directory and /tmp) instead of the whole
+ * filesystem, and exports never overwrite an existing file unless asked.
+ */
+function allowedTransferRoots(config) {
+  const home = homedir()
+  return [transferDirOf(config), home, join(home, 'Desktop'), join(home, 'Documents'), join(home, 'Downloads'), '/tmp']
+}
+
+function confinePath(config, rawPath) {
+  const expanded = String(rawPath ?? '').trim().replace(/^~(?=\/|$)/, homedir())
+  const target = resolve(expanded)
+  const allowed = allowedTransferRoots(config).map((root) => resolve(root))
+  if (!allowed.some((root) => target === root || target.startsWith(`${root}${sep}`))) {
+    throw new Error(`路径必须位于以下目录内：${allowed.join('、')}`)
+  }
+  return target
+}
+
+/** Where an export should land: the transfer directory, an explicit file, or a directory. */
+function resolveExportTarget(config, options) {
+  const dest = typeof options.dest === 'string' && options.dest.trim().length > 0 ? options.dest.trim() : null
+  const dirOption = typeof options.dir === 'string' && options.dir.trim().length > 0 ? options.dir.trim() : null
+  if (dest === null && dirOption === null) return { dir: transferDirOf(config), file: null }
+  if (dest !== null) {
+    const target = confinePath(config, dest)
+    if (!target.endsWith('.json')) throw new Error('导出目标必须以 .json 结尾')
+    const parent = dirname(target)
+    if (!existsSync(parent)) throw new Error(`目标目录不存在：${parent}`)
+    return { dir: parent, file: basename(target) }
+  }
+  const dir = confinePath(config, dirOption)
+  if (!existsSync(dir)) throw new Error(`目标目录不存在：${dir}`)
+  return { dir, file: null }
+}
+
+/** Reveal one file in the desktop file manager (macOS `open -R`); best effort. */
+function revealPath(path) {
+  if (process.platform !== 'darwin') return false
+  try {
+    execFile('open', ['-R', path], () => {})
+    return true
+  } catch {
+    return false
+  }
 }
 
 /** Deterministic serialization: the checksum must not depend on key order. */
@@ -2012,12 +2062,16 @@ async function listTransferFiles(config) {
 
 /** Read one transfer file, enforcing the name shape and the size ceiling. */
 async function readTransferFile(config, fileName) {
-  const safe = String(fileName ?? '').replace(/[^A-Za-z0-9._-]/g, '')
-  if (!safe.endsWith('.json')) throw new Error('only .json bundles can be imported')
-  const path = join(transferDirOf(config), safe)
+  const raw = String(fileName ?? '').trim()
+  // A bare name resolves inside the transfer directory; an absolute path must
+  // still be confined to the allowed roots.
+  const path = raw.includes('/') || raw.startsWith('~')
+    ? confinePath(config, raw)
+    : join(transferDirOf(config), raw.replace(/[^A-Za-z0-9._-]/g, ''))
+  if (!path.endsWith('.json')) throw new Error('only .json bundles can be imported')
   const info = await stat(path)
   if (info.size > TRANSFER_MAX_BYTES) throw new Error(`bundle too large: ${info.size} bytes > ${TRANSFER_MAX_BYTES}`)
-  return { fileName: safe, path, text: await readFile(path, 'utf8') }
+  return { fileName: basename(path), path, text: await readFile(path, 'utf8') }
 }
 
 /**
@@ -3321,13 +3375,22 @@ function setupTransferBridge(ctx, config) {
               sendBridgeJson(res, 200, { ok: false, code: 'too-large', message: `bundle would be ${bytes} bytes > ${TRANSFER_MAX_BYTES}` })
               return
             }
-            const fileName = `memory-export-${new Date(at).toISOString().replace(/[:.]/g, '-')}-${exportScopeLabel(options, material)}.json`
-            await mkdir(transferDirOf(config), { recursive: true })
-            await writeFile(join(transferDirOf(config), fileName), text, { mode: 0o600 })
+            const target = resolveExportTarget(config, options)
+            const fileName = target.file ?? `memory-export-${new Date(at).toISOString().replace(/[:.]/g, '-')}-${exportScopeLabel(options, material)}.json`
+            const fullPath = join(target.dir, fileName)
+            if (existsSync(fullPath) && options.overwrite !== true) {
+              sendBridgeJson(res, 200, { ok: false, code: 'dest-exists', path: fullPath, message: `${fullPath} 已存在；如需覆盖请传 overwrite: true` })
+              return
+            }
+            await mkdir(target.dir, { recursive: true })
+            await writeFile(fullPath, text, { mode: 0o600 })
             sendBridgeJson(res, 200, {
               ok: true,
               file: fileName,
-              path: join(transferDirOf(config), fileName),
+              path: fullPath,
+              dir: target.dir,
+              inTransfer: resolve(target.dir) === resolve(transferDirOf(config)),
+              revealed: options.reveal === true ? revealPath(fullPath) : false,
               bytes,
               counts: bundle.counts,
               checksum: bundle.checksum,
