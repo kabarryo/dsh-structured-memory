@@ -93,7 +93,7 @@ export const SAVE_MEMORY_CONTENT_RULE = "CONTENT RULE: this session keeps ONE me
 /* ------------------------- transfer (export / import) -------------------- */
 const TRANSFER_PATH = '/api/dsh-memory-transfer'
 const TRANSFER_DIR = 'transfer'
-const PLUGIN_VERSION = '2.19.1'
+const PLUGIN_VERSION = '2.19.2'
 const EXPORT_KIND = 'dsh-structured-memory-export'
 const EXPORT_FORMAT = 1
 const TRANSFER_MAX_BYTES = 5 * 1024 * 1024
@@ -2866,7 +2866,8 @@ export const SESSION_CONSOLIDATION_INSTRUCTION = [
   '4. **内容分工**：只保留结论、当前状态、不可从仓库或文档反推的取舍、坐标（路径/命令/编号/版本号）与**指针**（过程档案的位置）；',
   '   **优先删除**过程性叙述、实测数字、踩坑经过、沿革说明与提交哈希——它们属于项目文档，不属于记忆。',
   '5. 目标：字符数降到原来的 40% 以下，同时保持可读（读者能只看这一条就知道该会话的结论与去哪儿查细节）。',
-  '6. keyPoint 是给"全局索引"用的整段摘要（不超过 50 字），要与 content 保持一致。',
+  '6. **过程档案指针必须保留**：若材料中出现「过程档案」段落（形如 【过程档案】<路径>），结果中必须原样保留其路径，并写成"记忆不足以解决问题时进一步读取该文档"的引导句；不得因为压缩而删掉它。',
+  '7. keyPoint 是给"全局索引"用的整段摘要（不超过 50 字），要与 content 保持一致。',
 ].join('\n')
 
 /**
