@@ -1,0 +1,18 @@
+# dsh-memory bundle patch: mounts the memory plugin into any profile that
+# lists this bundle.
+- insert:
+    - id: dsh-memory
+      name: dsh-memory
+      config:
+        maxMemoriesPerSession: 1000
+        injectLimit: 20
+        maxInjectBytes: 8192
+        maxProfilePoints: 100
+        autoBackupMin: 1440
+        backupRetainDays: 7
+        migration: true
+        # Non-user-request saves must cite an evidence anchor (v2.4).
+        saveRequireEvidence: true
+        # Delegated subagents may read memories (recall/load) but not save or
+        # delete them; set false to give subagents full write access.
+        subagentMemoryReadOnly: true
