@@ -184,6 +184,9 @@ function destHint(value) {
       const [sessionDraft, setSessionDraft] = react.useState(null)
       const [sessionDraftStatus, setSessionDraftStatus] = react.useState('')
       const [dreamBusy, setDreamBusy] = react.useState(false)
+      const [rewriteDraft, setRewriteDraft] = react.useState(null)
+      const [rewriteKeyPoint, setRewriteKeyPoint] = react.useState('')
+      const [rewriteArm, setRewriteArm] = react.useState(false)
       const [transferFiles, setTransferFiles] = react.useState(null)
       const [snapshots, setSnapshots] = react.useState(null)
       const [transferNote, setTransferNote] = react.useState('')
@@ -645,6 +648,39 @@ function destHint(value) {
           setTransferNote(`回滚失败：${String((error && error.message) || error)}`)
         } finally {
           setTransferBusy(false)
+        }
+      }
+
+      async function submitRewrite(sessionId) {
+        if (rewriteDraft === null) return
+        if (!rewriteArm) {
+          setRewriteArm(true)
+          setSessionDraftStatus('再点一次以确认重写这一条（会先快照吗：不会，重写前请自行确认内容）')
+          return
+        }
+        setDreamBusy(true)
+        setSessionDraftStatus('正在重写…')
+        try {
+          const result = await api('POST', {
+            ops: [{ op: 'memory.replace', sessionId, content: rewriteDraft, keyPoint: rewriteKeyPoint.trim().length > 0 ? rewriteKeyPoint.trim() : undefined }],
+          })
+          if (result.ok !== true) {
+            setSessionDraftStatus(`重写被拒：${result.message || result.code}`)
+            setRewriteArm(false)
+            return
+          }
+          setState({ phase: 'ready', view: result })
+          setDraft(draftOf(result))
+          setSessionDraftStatus((result.actions ?? []).join('；') || '已重写')
+          setRewriteDraft(null)
+          setRewriteKeyPoint('')
+          setRewriteArm(false)
+          void loadSessions()
+          void loadSession(sessionId)
+        } catch (error) {
+          setSessionDraftStatus(`重写失败：${String((error && error.message) || error)}`)
+        } finally {
+          setDreamBusy(false)
         }
       }
 
@@ -1543,6 +1579,22 @@ function destHint(value) {
                   },
                   dreamBusy ? '生成中…' : '整理该会话（模型压缩）',
                 ),
+                h(
+                  'button',
+                  {
+                    className: 'dshmem-btn',
+                    onClick: () => {
+                      const content = sessionDetail.memories[0]?.content ?? ''
+                      const entry = (draft.global ?? []).find((row) => row.sessionId === sessionDetail.sessionId)
+                      setRewriteDraft(content)
+                      setRewriteKeyPoint(typeof entry?.keyPoints === 'string' ? entry.keyPoints : '')
+                      setRewriteArm(false)
+                      setSessionDraftStatus(`将重写该会话的唯一一条记忆（当前 ${Array.from(content).length} 字）`)
+                    },
+                    disabled: dreamBusy || sessionDetail.memories.length === 0,
+                  },
+                  '重写这条',
+                ),
                 sessionDetail.memories.length > 1
                   ? h(
                   'button',
@@ -1569,6 +1621,42 @@ function destHint(value) {
                 h('span', { className: 'dshmem-meta' }, '合并同主题、删除重复与已被推翻/过时的内容；应用前自动快照，可回滚'),
               ),
               sessionDraftStatus.length === 0 ? null : h('div', { className: 'dshmem-meta' }, sessionDraftStatus),
+              rewriteDraft === null
+                ? null
+                : h(
+                    'div',
+                    { className: 'dshmem-entry' },
+                    h('div', { className: 'dshmem-meta' }, `重写为（当前 ${Array.from(rewriteDraft).length} 字，上限 16000）`),
+                    h('textarea', {
+                      value: rewriteDraft,
+                      rows: 10,
+                      style: { width: '100%' },
+                      onChange: (event) => setRewriteDraft(event.target.value),
+                    }),
+                    h(
+                      'div',
+                      { className: 'dshmem-field' },
+                      h('label', null, '索引摘要（keyPoint，留空自动推导）'),
+                      h('input', {
+                        value: rewriteKeyPoint,
+                        onChange: (event) => setRewriteKeyPoint(event.target.value),
+                      }),
+                    ),
+                    h(
+                      'div',
+                      { className: 'dshmem-bar' },
+                      h('button', {
+                        className: rewriteArm ? 'dshmem-btn dshmem-del' : 'dshmem-btn primary',
+                        onClick: () => void submitRewrite(sessionDetail.sessionId),
+                        disabled: dreamBusy || rewriteDraft.trim().length === 0,
+                      }, rewriteArm ? '确认重写' : '重写'),
+                      h('button', {
+                        className: 'dshmem-btn',
+                        onClick: () => { setRewriteDraft(null); setRewriteKeyPoint(''); setRewriteArm(false); setSessionDraftStatus('已取消重写') },
+                        disabled: dreamBusy,
+                      }, '取消'),
+                    ),
+                  ),
               sessionDraft === null
                 ? null
                 : h(

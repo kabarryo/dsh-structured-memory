@@ -87,7 +87,7 @@ const DEFAULT_INHERIT_FORK_MEMORY = true
 /* ------------------------- transfer (export / import) -------------------- */
 const TRANSFER_PATH = '/api/dsh-memory-transfer'
 const TRANSFER_DIR = 'transfer'
-const PLUGIN_VERSION = '2.18.0'
+const PLUGIN_VERSION = '2.19.0'
 const EXPORT_KIND = 'dsh-structured-memory-export'
 const EXPORT_FORMAT = 1
 const TRANSFER_MAX_BYTES = 5 * 1024 * 1024
@@ -2435,6 +2435,56 @@ function applyStoreOps(webCtx, config, ops) {
       if (op.op === 'doctor.repair') {
         const result = await repairMemoryLinks(config)
         actions.push(...result.actions)
+        changed++
+        continue
+      }
+
+      if (op.op === 'memory.replace') {
+        // Rewrite (not append) the session's single memory. Keeps the id and
+        // createdAt, restarts mergedCount, and re-syncs the derived index and the
+        // session's entry — the same invariants a save maintains.
+        const sessionId = safeSessionId(op.sessionId)
+        const doc = await readSessionMemory(config, sessionId)
+        if (doc === null) return reject(`no session file for ${sessionId}`)
+        const content = String(op.content ?? '').trim()
+        if (content.length === 0) return reject('memory.replace: content is required')
+        const length = Array.from(content).length
+        if (length > SESSION_MEMORY_MAX_CHARS) return reject(`memory.replace: content is ${length} characters, over the ${SESSION_MEMORY_MAX_CHARS} ceiling`)
+        const single = doc.memories[0]
+        const category = typeof op.category === 'string' && op.category.length > 0
+          ? op.category
+          : (single?.category ?? DEFAULT_CATEGORY)
+        const now = Date.now()
+        const next = {
+          id: typeof single?.id === 'string' && single.id.length > 0 ? single.id : randomUUID(),
+          content,
+          category,
+          createdAt: Number.isFinite(single?.createdAt) ? single.createdAt : now,
+          updatedAt: now,
+          mergedCount: 1,
+        }
+        doc.memories = [next]
+        doc.updatedAt = now
+        if (typeof op.title === 'string' && op.title.trim().length > 0) doc.title = op.title.trim()
+        await writeSessionMemory(config, sessionId, doc)
+        await indexRemove(config, { sessionId })
+        await indexUpsert(config, {
+          sessionId,
+          memoryId: next.id,
+          category: next.category,
+          content: next.content,
+          createdAt: next.createdAt,
+        })
+        const keyPoint = typeof op.keyPoint === 'string' && op.keyPoint.trim().length > 0
+          ? op.keyPoint.trim()
+          : normalizeKeyPoint(undefined, content)
+        await upsertSessionEntryLocked(config, sessionId, {
+          keyPoint,
+          title: typeof op.title === 'string' && op.title.trim().length > 0 ? op.title.trim() : (typeof doc.title === 'string' ? doc.title : undefined),
+          category: next.category,
+          lastActivity: now,
+        })
+        actions.push(`重写记忆：${sessionId}（${length} 字）`)
         changed++
         continue
       }
