@@ -93,7 +93,7 @@ export const SAVE_MEMORY_CONTENT_RULE = "CONTENT RULE: this session keeps ONE me
 /* ------------------------- transfer (export / import) -------------------- */
 const TRANSFER_PATH = '/api/dsh-memory-transfer'
 const TRANSFER_DIR = 'transfer'
-const PLUGIN_VERSION = '2.19.2'
+const PLUGIN_VERSION = '2.19.3'
 const EXPORT_KIND = 'dsh-structured-memory-export'
 const EXPORT_FORMAT = 1
 const TRANSFER_MAX_BYTES = 5 * 1024 * 1024
@@ -810,11 +810,25 @@ function charLen(text) {
   return Array.from(String(text)).length
 }
 
-/** Truncate to `max` code points; never mid-surrogate. */
+/** Clip to a character budget without cutting a word or clause in half: prefer
+ * the last clause separator inside the window, fall back to whitespace, and mark
+ * the clip with an ellipsis so a shortened line never reads as a complete one. */
 function truncateChars(text, max) {
   const chars = Array.from(String(text))
   if (chars.length <= max) return text
-  return chars.slice(0, max).join('')
+  const room = Math.max(1, max - 1) // the ellipsis has to fit inside the cap
+  const window = chars.slice(0, room).join('')
+  const floor = Math.max(8, Math.floor(room * 0.6))
+  const lastBreak = (pattern) => {
+    for (let at = window.length; at >= floor; at -= 1) {
+      if (pattern.test(window[at - 1])) return at
+    }
+    return -1
+  }
+  let cut = lastBreak(/[，；。！？、,;.!?]/)
+  if (cut === -1) cut = lastBreak(/[\s)"]/)
+  if (cut === -1) cut = room
+  return `${window.slice(0, cut).replace(/[，；、,;\s]+$/, '')}…`
 }
 
 /**
@@ -2867,7 +2881,8 @@ export const SESSION_CONSOLIDATION_INSTRUCTION = [
   '   **优先删除**过程性叙述、实测数字、踩坑经过、沿革说明与提交哈希——它们属于项目文档，不属于记忆。',
   '5. 目标：字符数降到原来的 40% 以下，同时保持可读（读者能只看这一条就知道该会话的结论与去哪儿查细节）。',
   '6. **过程档案指针必须保留**：若材料中出现「过程档案」段落（形如 【过程档案】<路径>），结果中必须原样保留其路径，并写成"记忆不足以解决问题时进一步读取该文档"的引导句；不得因为压缩而删掉它。',
-  '7. keyPoint 是给"全局索引"用的整段摘要（不超过 50 字），要与 content 保持一致。',
+  '7. keyPoint 是给"全局索引"用的整段摘要，要与 content 保持一致：目标 ≤50 字；**含路径/命令/版本号等关键标识时可到 100 字**（插件按标识自动放宽）。',
+  '8. **不得在词中间截断** keyPoint（例如"terminal schedu"、"（清 13"）：宁可写一句更短的完整话；标识与结论不能同时放下时，保留标识并省略铺陈。',
 ].join('\n')
 
 /**
