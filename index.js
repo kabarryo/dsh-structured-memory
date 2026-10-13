@@ -93,7 +93,7 @@ export const SAVE_MEMORY_CONTENT_RULE = "HIERARCHY: injected profile/index -> th
 /* ------------------------- transfer (export / import) -------------------- */
 const TRANSFER_PATH = '/api/dsh-memory-transfer'
 const TRANSFER_DIR = 'transfer'
-const PLUGIN_VERSION = '2.19.4'
+const PLUGIN_VERSION = '2.19.5'
 const EXPORT_KIND = 'dsh-structured-memory-export'
 const EXPORT_FORMAT = 1
 const TRANSFER_MAX_BYTES = 5 * 1024 * 1024
@@ -1900,7 +1900,72 @@ async function auditMemoryLinks(config) {
     // machine, which is normal for imported memories and is NOT an anomaly.
     sessionLinks: sessionLinkScan ?? { at: null, dshSessions: 0, memories: sessions.length, linked: [], dangling: [] },
     duplicateEntries: [...bySession.entries()].filter(([, list]) => list.length > 1).map(([sessionId, list]) => ({ sessionId, ids: list.map((entry) => entry.id) })),
+    // Title/category are one logical field projected into both stores; a mismatch
+    // means an edit landed on only one side (or an import carried a stale pair).
+    attributeMismatches: attributeMismatchesOf(sessions, bySession),
   }
+}
+
+/**
+ * Title and category are single logical fields: the session file holds the
+ * record, the global entry is its projection. Every write goes through here so
+ * the two editor tabs can never disagree — and so a stale projection can never
+ * revert a value the operator just changed.
+ */
+async function syncSessionAttributes(config, sessionId, { title, category }) {
+  if (typeof sessionId !== 'string' || sessionId.length === 0) return false
+  const doc = await readSessionMemory(config, sessionId)
+  if (doc === null) return false
+  const single = Array.isArray(doc.memories) ? doc.memories[0] : undefined
+  let touched = false
+  if (typeof title === 'string' && title.trim().length > 0 && doc.title !== title.trim()) {
+    doc.title = title.trim()
+    touched = true
+  }
+  if (typeof category === 'string' && category.length > 0 && single !== undefined && single.category !== category) {
+    single.category = category
+    touched = true
+  }
+  if (!touched) return false
+  doc.updatedAt = Number.isFinite(doc.updatedAt) ? doc.updatedAt : Date.now()
+  await writeSessionMemory(config, sessionId, doc)
+  if (single !== undefined) {
+    await indexUpsert(config, {
+      sessionId,
+      memoryId: String(single.id ?? ''),
+      category: single.category,
+      content: String(single.content ?? ''),
+      createdAt: Number.isFinite(single.createdAt) ? single.createdAt : Date.now(),
+    })
+  }
+  return true
+}
+
+/** Entries whose title/category disagree with their session record. */
+function attributeMismatchesOf(sessions, bySession) {
+  const norm = (value) => (typeof value === 'string' && value.length > 0 ? value : null)
+  const rows = []
+  for (const session of sessions) {
+    const entry = bySession.get(session.sessionId)?.[0]
+    if (entry === undefined) continue
+    const docTitle = norm(session.title)
+    const entryTitle = norm(entry.title)
+    const docCategory = norm(session.category)
+    const entryCategory = norm(entry.category)
+    const titleDiffers = docTitle !== entryTitle && docTitle !== null && entryTitle !== null
+    const categoryDiffers = docCategory !== null && entryCategory !== null && docCategory !== entryCategory
+    if (titleDiffers || categoryDiffers) {
+      rows.push({
+        sessionId: session.sessionId,
+        entryId: entry.id,
+        docTitle,
+        entryTitle,
+        docCategory,
+        entryCategory,
+      })
+    }
+  }
+  return rows
 }
 
 /** Repair the audited link problems; returns what was changed. */
@@ -1960,6 +2025,49 @@ async function repairMemoryLinks(config) {
     actions.push(`折叠为一条：${row.sessionId}（${row.count} → 1 条）`)
   }
 
+  for (const row of audit.attributeMismatches ?? []) {
+    const doc = await readSessionMemory(config, row.sessionId)
+    if (doc === null) continue
+    const single = Array.isArray(doc.memories) ? doc.memories[0] : undefined
+    const entries = await readGlobal(config)
+    const entry = entries.find((candidate) => candidate.id === row.entryId)
+    if (entry === undefined) continue
+    // The session record wins when it carries a value; an empty record is filled
+    // from the entry (that is what was injected and what the operator saw).
+    let docTouched = false
+    let entryTouched = false
+    if (row.docTitle === null && row.entryTitle !== null) {
+      doc.title = row.entryTitle
+      docTouched = true
+    } else if (row.docTitle !== null && row.docTitle !== row.entryTitle) {
+      entry.title = row.docTitle
+      entryTouched = true
+    }
+    if (single !== undefined) {
+      if (row.docCategory === null && row.entryCategory !== null) {
+        single.category = row.entryCategory
+        docTouched = true
+      } else if (row.docCategory !== null && row.docCategory !== row.entryCategory) {
+        entry.category = row.docCategory
+        entryTouched = true
+      }
+    }
+    if (docTouched) {
+      doc.updatedAt = Number.isFinite(doc.updatedAt) ? doc.updatedAt : Date.now()
+      await writeSessionMemory(config, row.sessionId, doc)
+    }
+    if (entryTouched) await writeGlobal(config, entries)
+    if (single !== undefined && (docTouched || entryTouched)) {
+      await indexUpsert(config, {
+        sessionId: row.sessionId,
+        memoryId: String(single.id ?? ''),
+        category: typeof entry.category === 'string' ? entry.category : single.category,
+        content: String(single.content ?? ''),
+        createdAt: Number.isFinite(single.createdAt) ? single.createdAt : Date.now(),
+      })
+    }
+    if (docTouched || entryTouched) actions.push(`对齐标题/分类：${row.sessionId}`)
+  }
   for (const sessionId of audit.emptySessions) {
     const file = sessionPathOf(memoryRootOf(config), sessionId)
     try {
@@ -2349,6 +2457,7 @@ async function listSessionSummaries(config) {
     rows.push({
       sessionId,
       title: typeof doc.title === 'string' && doc.title.length > 0 ? doc.title : null,
+      category: typeof memories[0]?.category === 'string' ? memories[0].category : null,
       count: memories.length,
       updatedAt: Number.isFinite(doc.updatedAt) ? doc.updatedAt : null,
       bytes: Buffer.byteLength(JSON.stringify(memories), 'utf8'),
@@ -2458,6 +2567,11 @@ function applyStoreOps(webCtx, config, ops) {
           const category = op.category.trim().slice(0, BRIDGE_CATEGORY_MAX_CHARS)
           entry.category = category.length > 0 ? category : DEFAULT_CATEGORY
         }
+        // Write through: the entry is a projection of the session record.
+        await syncSessionAttributes(config, entry.sessionId, {
+          title: typeof op.title === 'string' ? entry.title : undefined,
+          category: typeof op.category === 'string' ? entry.category : undefined,
+        })
         changed++
         globalChanged = true
         continue
@@ -2524,7 +2638,9 @@ function applyStoreOps(webCtx, config, ops) {
           : normalizeKeyPoint(undefined, content)
         await upsertSessionEntryLocked(config, sessionId, {
           keyPoint,
-          title: typeof op.title === 'string' && op.title.trim().length > 0 ? op.title.trim() : (typeof doc.title === 'string' ? doc.title : undefined),
+          // Never project a stale doc.title onto the entry: the entry may carry the
+          // operator's rename, and rewriting content must not undo it.
+          title: typeof op.title === 'string' && op.title.trim().length > 0 ? op.title.trim() : undefined,
           category: next.category,
           lastActivity: now,
         })

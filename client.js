@@ -491,10 +491,11 @@ function destHint(value) {
           const result = await api('GET', undefined, '?doctor=1')
           setAudit(result)
           const multi = result.multiMemorySessions?.length ?? 0
-          const problems = (result.missingEntries?.length ?? 0) + (result.orphanEntries?.length ?? 0) + (result.emptySessions?.length ?? 0) + (result.duplicateEntries?.length ?? 0) + multi
+          const attrs = result.attributeMismatches?.length ?? 0
+          const problems = (result.missingEntries?.length ?? 0) + (result.orphanEntries?.length ?? 0) + (result.emptySessions?.length ?? 0) + (result.duplicateEntries?.length ?? 0) + multi + attrs
           setAuditNote(problems === 0
             ? `一致：${result.counts.sessions} 个会话 ↔ ${result.counts.entries} 条索引，且每会话恰好 1 条记忆`
-            : `发现 ${problems} 处不一致：缺条目 ${result.missingEntries.length}、孤儿条目 ${result.orphanEntries.length}、空会话 ${result.emptySessions.length}、重复条目 ${result.duplicateEntries.length}、多记忆会话 ${multi}`)
+            : `发现 ${problems} 处不一致：缺条目 ${result.missingEntries.length}、孤儿条目 ${result.orphanEntries.length}、空会话 ${result.emptySessions.length}、重复条目 ${result.duplicateEntries.length}、多记忆会话 ${multi}、标题/分类分歧 ${attrs}`)
         } catch (error) {
           setAuditNote(`校验失败：${String((error && error.message) || error)}`)
         } finally {
@@ -901,6 +902,9 @@ function destHint(value) {
                   audit.emptySessions.length > 0 ? `空会话：${audit.emptySessions.map((id) => id.slice(0, 16)).join('、')}` : null,
                   audit.duplicateEntries.length > 0 ? `重复条目：${audit.duplicateEntries.map((row) => row.sessionId.slice(0, 16)).join('、')}` : null,
                   (audit.multiMemorySessions?.length ?? 0) > 0 ? `多记忆会话（应为 1 条）：${audit.multiMemorySessions.map((row) => `${row.sessionId.slice(0, 16)}(${row.count})`).join('、')}` : null,
+                  (audit.attributeMismatches?.length ?? 0) > 0
+                    ? `标题/分类分歧（索引 vs 会话记录）：${audit.attributeMismatches.map((row) => `${row.sessionId.slice(0, 16)}「${row.entryTitle ?? '—'}」/「${row.docTitle ?? '—'}」`).join('、')}`
+                    : null,
                 ].filter(Boolean).join(' ｜ ') || '（无异常）',
               ),
         ),
