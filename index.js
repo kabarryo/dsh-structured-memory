@@ -67,7 +67,7 @@ import { defineTool } from '@deepseek-ai/dsh-tools'
 import { createUserMessage, BlockAssembler } from '@deepseek-ai/dsh-llm'
 import { openSearchIndex } from './search-index.js'
 
-export const name = 'dsh-memory'
+export const name = 'dsh-structured-memory'
 export const inject = ['agents', 'tools', 'systemPrompt']
 
 const DEFAULT_CATEGORY = 'general'

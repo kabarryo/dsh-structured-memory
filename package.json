@@ -1,5 +1,5 @@
 {
-  "name": "dsh-memory",
+  "name": "dsh-structured-memory",
   "version": "2.16.2",
   "description": "Persistent cross-session memory for DSH: user profile + global compact index (runtime-context injected, change-triggered) + on-demand session memories, FTS5 search, auto backup, read-only memory for subagents, and a Plugins-page editor for the profile and global index.",
   "license": "MIT",
@@ -70,5 +70,14 @@
     "react": {
       "optional": true
     }
+  },
+  "author": "kabarryo",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/kabarryo/dsh-structured-memory.git"
+  },
+  "homepage": "https://github.com/kabarryo/dsh-structured-memory#readme",
+  "bugs": {
+    "url": "https://github.com/kabarryo/dsh-structured-memory/issues"
   }
 }

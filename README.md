@@ -1,4 +1,4 @@
-# dsh-memory
+# dsh-structured-memory
 
 DSH 跨会话记忆插件：用户画像 + 全局紧凑索引（运行时上下文注入，变化才注入）+ 按需会话记忆检索 + FTS5 全文搜索 + 自动备份。
 
@@ -8,7 +8,7 @@ DSH 跨会话记忆插件：用户画像 + 全局紧凑索引（运行时上下�
 
 插件为 DSH bundle 层（`cordis.patch.yml` 挂载），无外部依赖（node:sqlite / fs 内置，零新依赖）。
 
-1. 将本目录（`dsh-memory/`，需含 `index.js`、`search-index.js`、`cordis.patch.yml`、`package.json`）作为 bundle 层装入 DSH profile（装入方式：替换/指向 `~/.dsh/memory-plugin/` 或按 DSH bundle 配置引用本目录）
+1. 将本目录（`dsh-structured-memory/`，需含 `index.js`、`search-index.js`、`cordis.patch.yml`、`package.json`）作为 bundle 层装入 DSH profile（装入方式：替换/指向 `~/.dsh/memory-plugin/` 或按 DSH bundle 配置引用本目录）
 2. **重启 DSH 进程**使 bundle JS 生效（`patchReload: live` 只热更 patch yml，不热更 JS）
 3. 验证：对话中要求模型调用 `save_memory`，再发新消息确认注入出现 `<user_profile>` 与 `<global_memory_index>`
 
@@ -51,7 +51,7 @@ DSH 跨会话记忆插件：用户画像 + 全局紧凑索引（运行时上下�
 
 ## 插件页配置界面（v2.5）
 
-入口：侧栏 **插件 → dsh-memory → 配置**（DSH 的 `plugins.row.config` slot，key 规则为 `<包名>#<patch 行 id>`，即 `dsh-memory#dsh-memory`）。可人工优化的内容：
+入口：侧栏 **插件 → dsh-structured-memory → 配置**（DSH 的 `plugins.row.config` slot，key 规则为 `<包名>#<patch 行 id>`，即 `dsh-structured-memory#dsh-structured-memory`）。可人工优化的内容：
 
 | 页签 | 可编辑 |
 |---|---|
@@ -64,7 +64,7 @@ DSH 跨会话记忆插件：用户画像 + 全局紧凑索引（运行时上下�
 实现要点：
 
 - `client.js` 采用 DSH 客户端的模块加载格式（`window.__ModuleLoader__.load({ id, factory })` + `require('react')`），**无需构建步骤**，直接作为 `exports["./client"]` 发布。
-- 读写走插件自建的 **loopback bridge** `/api/dsh-memory-store`：`GET` 读全量视图，`POST { ops: [...] }` 写入；仅接受 127.0.0.1 / ::1。
+- 读写走插件自建的 **loopback bridge** `/api/dsh-structured-memory-store`：`GET` 读全量视图，`POST { ops: [...] }` 写入；仅接受 127.0.0.1 / ::1。
 - **JSON 仍是唯一事实源**：界面写入的就是模型 `save_memory` 写的那两份文件，不存在第二份真相。
 - 写入纳入与 `save_memory`/`forget_memory` **相同的每 root 串行锁**；只重写被改动的那一层（改全局索引不会动画像时间戳）；操作是字段级的（`profile.replace` / `global.update` / `global.remove`），不做整文件覆盖，因此并发的模型写入不会被界面回写冲掉。
 - 保存后**无需重启**：注入快照的渲染缓存以文件 mtime+size 为键，下一次组装即取新内容。
@@ -141,7 +141,7 @@ DSH 跨会话记忆插件：用户画像 + 全局紧凑索引（运行时上下�
 | 会话层整理 | 应用后**刷新该会话的条目摘要**（模型额外产出 `keyPoint`），条目缺失时补建——重写记忆不会让会话失去索引 |
 | 插件页删除 | 已关联会话的条目**不允许单独删除**（`global.remove` 拒绝），只能「会话记忆 → 删除整会话」；孤儿条目可单独删 |
 
-**一致性自检与修复**：`GET /api/dsh-memory-store?doctor=1` 报告四类问题——缺条目的会话、孤儿条目、空会话、重复条目；界面「全局索引 → 校验关联 / 修复不一致」可一键修复（补建条目用该会话首条记忆生成摘要）。修复是幂等的。
+**一致性自检与修复**：`GET /api/dsh-structured-memory-store?doctor=1` 报告四类问题——缺条目的会话、孤儿条目、空会话、重复条目；界面「全局索引 → 校验关联 / 修复不一致」可一键修复（补建条目用该会话首条记忆生成摘要）。修复是幂等的。
 
 **存储与注入的分工（v2.15 起：全部条目始终注入）**：完整性归存储层（所有会话都必须有条目）；注入层**始终列出全部条目**，不存在"未注入条目"。`injectLimit` 的语义改为"**带要点条数**"——前 N 条（按最近活动）显示要点，其余仅列标题；`maxInjectBytes` 超预算时**逐级降级**：完整要点 → 要点截断到 24 字 → 仅标题 → 一行计数提示（`共 N 条，请用 recall_memory(scope:"global") 列出`），**索引块永不被整块丢弃**（此前会 `texts.pop()` 丢掉索引，那正是记忆变得不可发现的路径）。注入文案同时写明两条读取路径与成本差：`recall_memory(query)` 全文检索便宜、`load_session_memory(sessionId)` 整会话可能上万 token。
 
@@ -181,7 +181,7 @@ DSH 跨会话记忆插件：用户画像 + 全局紧凑索引（运行时上下�
 
 因此用法是：输入 `/dream` 回车→**认领**该命令（草稿里保留 `/dream `），再输入 `status`/`apply`/`discard` 回车执行，或直接回车＝生成建议；从 `/` 菜单选中 `dream` 同理。
 
-排查入口：`GET /api/dsh-memory-consolidate?commandsFor=<sessionId>` 会列出某会话可见的命令及其是否声明 `input`。
+排查入口：`GET /api/dsh-structured-memory-consolidate?commandsFor=<sessionId>` 会列出某会话可见的命令及其是否声明 `input`。
 
 ### 推理档位与"关掉思考"
 
@@ -214,7 +214,7 @@ DSH 跨会话记忆插件：用户画像 + 全局紧凑索引（运行时上下�
 **模型选择与成本**：默认沿用当前会话路由的模型（`agents` 服务解析，或最近一次记忆工具调用所用路由）；也可在 profile patch 里固定：
 
 ```yaml
-# dsh-memory 行 config 内
+# dsh-structured-memory 行 config 内
 consolidationProvider: opencode-go
 consolidationModel: qwen3.8-flash   # 建议用非推理模型
 consolidationMaxTokens: 32768
@@ -254,7 +254,7 @@ JSON 文件为唯一事实源（位于 `$DSH_HOME/memory/`，通常即 `~/.dsh/m
 
 ## 注入策略（v2.3：运行时上下文 + 变化检测）
 
-- **注册方式**：`ctx.systemPrompt.context({ name: 'dsh-memory', order: 130, text })` —— 与系统提示词/工具同策略（`inject` 需含 `systemPrompt`）
+- **注册方式**：`ctx.systemPrompt.context({ name: 'dsh-structured-memory', order: 130, text })` —— 与系统提示词/工具同策略（`inject` 需含 `systemPrompt`）
 - **每步重新渲染，但只在变化时注入**：DSH 的 `RuntimeContextProjection` 比对渲染结果与上次快照，相同则不产出任何消息
   - 实测：92 步会话中 DSH 自身运行时上下文只注入 1 次；本插件改造前注入 92 次（累积 62,062 tokens，占上下文 27.5%），改造后同口径降至 1 次
 - **跨会话即时可见**：其他会话 `save_memory` 改动 `global.json` → 本会话下一步渲染不同 → 恰好产出 1 条更新（无需重启、无需重开会话）
@@ -273,7 +273,7 @@ JSON 文件为唯一事实源（位于 `$DSH_HOME/memory/`，通常即 `~/.dsh/m
 | v2.3 | 注入机制重构：改用 DSH 运行时上下文（变化才注入），92 步注入从 92 次降至 1 次；子 agent 记忆收紧为只读 |
 | v2.3.1 | 修正记忆根解析：`$DSH_HOME` 是 DSH 状态目录而非用户主目录，旧写法得到 `~/.dsh/.dsh/memory` 并静默分裂成两个库；新增旧形态残留库的启动告警 |
 | v2.4 | 保存触发协议：`trigger` 封闭枚举（必填）+ 自动保存的证据锚 + 写入幂等；`saveRequireEvidence` 开关 |
-| v2.5 | 插件页配置界面：免构建 `client.js` + loopback bridge `/api/dsh-memory-store`，可人工编辑用户画像与全局索引 |
+| v2.5 | 插件页配置界面：免构建 `client.js` + loopback bridge `/api/dsh-structured-memory-store`，可人工编辑用户画像与全局索引 |
 | v2.16.2 | 模型整理后的单条记忆补齐 `updatedAt`/`mergedCount`（与保存路径字段一致） |
 | v2.16.1 | 「折叠为一条」仅在记忆多于一条时显示；「整理该会话」取消"≥2 条"限制（单条同样需要压缩） |
 | v2.16 | 每会话只保留一条记忆：保存改写该条（去重追加 + mergedCount），旧多条文件自动折叠，单条上限 16,000 字符；新增确定性 `session.collapse`（零 LLM 成本）；已有 9 个会话经模型压缩折叠为一条 |
@@ -317,17 +317,17 @@ DSH 0.2.0-rc.2 的 `@deepseek-ai/dsh-hmr` 支持插件源码热替换，但 base
 
 ## 许可证
 
-MIT（见 `LICENSE`，版权行 `Copyright (c) 2026 Ryo`）
+MIT（见 `LICENSE`，版权行 `Copyright (c) 2026 kabarryo`）
 
-## 发布到 npm（未执行；含改名步骤）
+## 本机挂载改名（可选；本仓库已用新名发布）
 
-npm 上 `dsh-memory` 已被占用，发布前需改名为 `dsh-structured-memory`。**改名不能只改一个文件**——本机 profile 是「按依赖名 + link 路径」挂载的，四处需同步：
+npm 上 `dsh-structured-memory` 已被占用，发布前需改名为 `dsh-structured-memory`。**改名不能只改一个文件**——本机 profile 是「按依赖名 + link 路径」挂载的，四处需同步：
 
 | 步骤 | 文件 | 改动 |
 |---|---|---|
 | 1 | `~/.dsh/memory-plugin/package.json` | `"name"` → `dsh-structured-memory` |
-| 2 | `~/.dsh/profiles/web/package.json` | `dependencies` 与 `dsh.profile.bundles` 中的 `dsh-memory` → 新名 |
+| 2 | `~/.dsh/profiles/web/package.json` | `dependencies` 与 `dsh.profile.bundles` 中的 `dsh-structured-memory` → 新名 |
 | 3 | profile 目录 | `pnpm install`（重建 link 依赖） |
 | 4 | — | **重启 DSH** 验证插件仍加载、注入与工具正常 |
 
-注：插件运行时的 `export const name = 'dsh-memory'`（供 `cordis.patch.yml` 的 `name:` 引用）与 npm 包名相互独立，改名时**不必**动它；若要一并更名，需同步改 `cordis.patch.yml`。
+注：插件运行时的 `export const name = 'dsh-structured-memory'`（供 `cordis.patch.yml` 的 `name:` 引用）与 npm 包名相互独立，改名时**不必**动它；若要一并更名，需同步改 `cordis.patch.yml`。
