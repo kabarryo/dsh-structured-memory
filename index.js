@@ -87,7 +87,7 @@ const DEFAULT_INHERIT_FORK_MEMORY = true
 /* ------------------------- transfer (export / import) -------------------- */
 const TRANSFER_PATH = '/api/dsh-memory-transfer'
 const TRANSFER_DIR = 'transfer'
-const PLUGIN_VERSION = '2.17.1'
+const PLUGIN_VERSION = '2.18.0'
 const EXPORT_KIND = 'dsh-structured-memory-export'
 const EXPORT_FORMAT = 1
 const TRANSFER_MAX_BYTES = 5 * 1024 * 1024
@@ -2060,6 +2060,39 @@ async function listTransferFiles(config) {
   return rows
 }
 
+/** Import snapshots (and any other manifest-bearing backup) for the page. */
+async function listBackupSnapshots(config, limit = 20) {
+  const dir = join(memoryRootOf(config), 'memory-backup')
+  let names = []
+  try {
+    names = await readdir(dir)
+  } catch {
+    return []
+  }
+  const rows = []
+  for (const name of names.sort().reverse()) {
+    const manifestPath = join(dir, name, 'manifest.json')
+    let manifest = null
+    try {
+      manifest = JSON.parse(await readFile(manifestPath, 'utf8'))
+    } catch {
+      manifest = null
+    }
+    const files = Array.isArray(manifest?.files) ? manifest.files : []
+    rows.push({
+      snapshot: name,
+      kind: manifest?.kind ?? null,
+      at: Number.isFinite(manifest?.at) ? manifest.at : null,
+      files: files.length,
+      sessions: files.filter((file) => String(file.relPath).startsWith('sessions/')).length,
+      created: files.filter((file) => file.state === 'absent').length,
+      rollbackable: manifest !== null,
+    })
+    if (rows.length >= limit) break
+  }
+  return rows
+}
+
 /** Read one transfer file, enforcing the name shape and the size ceiling. */
 async function readTransferFile(config, fileName) {
   const raw = String(fileName ?? '').trim()
@@ -3312,6 +3345,10 @@ function setupTransferBridge(ctx, config) {
         const query = new URL(req.url ?? '/', 'http://127.0.0.1').searchParams
         try {
           if (req.method === 'GET') {
+            if (query.get('snapshots') !== null) {
+              sendBridgeJson(res, 200, { ok: true, snapshots: await listBackupSnapshots(config) })
+              return
+            }
             const previewFile = query.get('preview')
             if (previewFile !== null) {
               const { fileName, text } = await readTransferFile(config, previewFile)

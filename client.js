@@ -21,6 +21,7 @@ window.__ModuleLoader__.load({
 
     const BRIDGE = '/api/dsh-memory-store'
     const CONSOLIDATE = '/api/dsh-memory-consolidate'
+    const TRANSFER = '/api/dsh-memory-transfer'
     const SECTIONS = [
       ['identity', '身份'],
       ['work', '工作'],
@@ -74,6 +75,52 @@ window.__ModuleLoader__.load({
       el.textContent = CSS
       document.head.appendChild(el)
     }
+
+/** Rough export size estimate. Measured JSON/正文 ratio is about 1.33. */
+const EXPORT_BYTES_PER_CONTENT = 1.33
+const EXPORT_OVERHEAD_BYTES = 2048
+
+function estimateExport(sessionRows, pickedIds, includeProfile, profilePoints) {
+  const rows = Array.isArray(sessionRows) ? sessionRows : []
+  const wanted = Array.isArray(pickedIds) && pickedIds.length > 0 ? new Set(pickedIds) : null
+  const picked = wanted === null ? rows : rows.filter((row) => wanted.has(row.sessionId))
+  const memories = picked.reduce((total, row) => total + (Number(row.count) || 0), 0)
+  const content = picked.reduce((total, row) => total + (Number(row.bytes) || 0), 0)
+  const profileBytes = includeProfile === true ? (Number(profilePoints) || 0) * 240 : 0
+  return {
+    sessions: picked.length,
+    memories,
+    contentBytes: content,
+    estimateBytes: Math.round((content + profileBytes) * EXPORT_BYTES_PER_CONTENT + EXPORT_OVERHEAD_BYTES),
+  }
+}
+
+/** Human lines for an import preview report. */
+function describeImportPlan(plan) {
+  if (plan === null || typeof plan !== 'object') return []
+  const list = (value) => (Array.isArray(value) ? value : [])
+  const sessions = list(plan.sessions)
+  const byMode = (mode) => sessions.filter((row) => row.mode === mode).length
+  const lines = [
+    `画像：新增 ${list(plan.profileAdds).length} · 跳过 ${list(plan.profileSkips).length}`,
+    `会话：新建 ${byMode('create')} · 合并 ${byMode('merge')} · 跳过 ${byMode('skip')} · 替换 ${byMode('replace')}`,
+    `将补建索引条目 ${list(plan.entriesToBuild).length} 个`,
+  ]
+  const rejected = list(plan.rejectedEntries)
+  if (rejected.length > 0) {
+    lines.push(`拒绝的孤儿条目 ${rejected.length} 个（${rejected.map((entry) => entry.title || entry.id).join('、')}）`)
+  }
+  return lines
+}
+
+/** Client-side pre-check for a destination path (the server enforces the rule). */
+function destHint(value) {
+  const text = String(value ?? '').trim()
+  if (text.length === 0) return ''
+  if (!text.startsWith('/') && !text.startsWith('~')) return '路径需为绝对路径（以 / 或 ~ 开头）'
+  if (!text.endsWith('.json')) return '文件名需以 .json 结尾'
+  return '服务端还会校验：须位于家目录或 /tmp 内，且默认不覆盖已存在文件'
+}
 
     async function api(method, body, query, base) {
       const init = { method }
@@ -137,6 +184,18 @@ window.__ModuleLoader__.load({
       const [sessionDraft, setSessionDraft] = react.useState(null)
       const [sessionDraftStatus, setSessionDraftStatus] = react.useState('')
       const [dreamBusy, setDreamBusy] = react.useState(false)
+      const [transferFiles, setTransferFiles] = react.useState(null)
+      const [snapshots, setSnapshots] = react.useState(null)
+      const [transferNote, setTransferNote] = react.useState('')
+      const [transferBusy, setTransferBusy] = react.useState(false)
+      const [exportCfg, setExportCfg] = react.useState({ scope: 'all', picked: [], profile: true, query: '', destMode: 'transfer', dest: '', overwrite: false, reveal: true })
+      const [exportResult, setExportResult] = react.useState(null)
+      const [importPick, setImportPick] = react.useState({ mode: 'transfer', file: '', path: '' })
+      const [importCfg, setImportCfg] = react.useState({ onExisting: 'merge', remapSessions: false, replaceProfile: false })
+      const [importPlan, setImportPlan] = react.useState(null)
+      const [importArm, setImportArm] = react.useState(false)
+      const [importResult, setImportResult] = react.useState(null)
+
       const [audit, setAudit] = react.useState(null)
       const [auditBusy, setAuditBusy] = react.useState(false)
       const [auditNote, setAuditNote] = react.useState('')
@@ -459,6 +518,136 @@ window.__ModuleLoader__.load({
         }
       }
 
+      async function loadTransfer() {
+        setTransferBusy(true)
+        setTransferNote('读取交换目录…')
+        try {
+          const [files, snaps] = await Promise.all([
+            api('GET', undefined, '?list=1', TRANSFER),
+            api('GET', undefined, '?snapshots=1', TRANSFER),
+          ])
+          const rows = files.ok === true ? (files.files ?? []) : []
+          const snapRows = snaps.ok === true ? (snaps.snapshots ?? []) : []
+          setTransferFiles(rows)
+          setSnapshots(snapRows)
+          setTransferNote(`${rows.length} 个 bundle · ${snapRows.length} 个快照 · ${files.dir ?? ''}`)
+        } catch (error) {
+          setTransferNote(`读取失败：${String((error && error.message) || error)}`)
+        } finally {
+          setTransferBusy(false)
+        }
+      }
+
+      async function runExport() {
+        setTransferBusy(true)
+        setTransferNote('导出中…')
+        setExportResult(null)
+        try {
+          const body = { profile: exportCfg.profile }
+          if (exportCfg.scope === 'sessions' && exportCfg.picked.length > 0) body.sessionIds = exportCfg.picked
+          if (exportCfg.query.trim().length > 0) body.query = exportCfg.query.trim()
+          if (exportCfg.destMode === 'custom' && exportCfg.dest.trim().length > 0) body.dest = exportCfg.dest.trim()
+          if (exportCfg.overwrite) body.overwrite = true
+          if (exportCfg.reveal) body.reveal = true
+          const result = await api('POST', body, '?export=1', TRANSFER)
+          if (result.ok !== true) {
+            setTransferNote(`导出失败：${result.message || result.code}`)
+            return
+          }
+          setExportResult(result)
+          setTransferNote(`已导出 ${result.file}`)
+          void loadTransfer()
+        } catch (error) {
+          setTransferNote(`导出失败：${String((error && error.message) || error)}`)
+        } finally {
+          setTransferBusy(false)
+        }
+      }
+
+      function importSpec() {
+        return importPick.mode === 'transfer' ? importPick.file : importPick.path.trim()
+      }
+
+      async function checkImport() {
+        const spec = importSpec()
+        if (spec.length === 0) {
+          setTransferNote('请先选择或填写要导入的 bundle')
+          return
+        }
+        setTransferBusy(true)
+        setTransferNote('检查中…')
+        setImportPlan(null)
+        setImportArm(false)
+        setImportResult(null)
+        try {
+          const result = await api('GET', undefined, `?preview=${encodeURIComponent(spec)}&onExisting=${importCfg.onExisting}`, TRANSFER)
+          if (result.ok !== true) {
+            setTransferNote(`检查失败：${result.message || result.code}`)
+            return
+          }
+          setImportPlan(result)
+          setTransferNote('检查通过（未写入任何数据）')
+        } catch (error) {
+          setTransferNote(`检查失败：${String((error && error.message) || error)}`)
+        } finally {
+          setTransferBusy(false)
+        }
+      }
+
+      async function runImport() {
+        if (importPlan === null) return
+        if (!importArm) {
+          setImportArm(true)
+          setTransferNote('再点一次以确认写入（写入前会自动快照）')
+          return
+        }
+        const spec = importSpec()
+        setTransferBusy(true)
+        setTransferNote('导入中…')
+        try {
+          const result = await api('POST', {
+            confirm: true,
+            onExisting: importCfg.onExisting,
+            remapSessions: importCfg.remapSessions,
+            replaceProfile: importCfg.replaceProfile,
+          }, `?import=${encodeURIComponent(spec)}`, TRANSFER)
+          if (result.ok !== true) {
+            setTransferNote(`导入失败：${result.message || result.code}`)
+            setImportArm(false)
+            return
+          }
+          setImportResult(result)
+          setImportPlan(null)
+          setImportArm(false)
+          setTransferNote(`导入完成 · 快照 ${result.snapshot}`)
+          void load()
+          void loadSessions()
+          void loadTransfer()
+        } catch (error) {
+          setTransferNote(`导入失败：${String((error && error.message) || error)}`)
+        } finally {
+          setTransferBusy(false)
+        }
+      }
+
+      async function rollbackTransfer(snapshot) {
+        setTransferBusy(true)
+        setTransferNote(`回滚 ${snapshot} …`)
+        try {
+          const result = await api('POST', {}, `?rollback=${encodeURIComponent(snapshot)}`, TRANSFER)
+          setTransferNote(result.ok === true
+            ? `已回滚：还原 ${result.restored.length} 个文件 · 删除 ${result.removed.length} 个`
+            : `回滚失败：${result.message || result.code}`)
+          void load()
+          void loadSessions()
+          void loadTransfer()
+        } catch (error) {
+          setTransferNote(`回滚失败：${String((error && error.message) || error)}`)
+        } finally {
+          setTransferBusy(false)
+        }
+      }
+
       async function makeDraft() {
         setTidyBusy(true)
         setTidyStatus('正在调用模型生成建议…')
@@ -582,6 +771,20 @@ window.__ModuleLoader__.load({
               },
             },
             '会话记忆',
+          ),
+          h(
+            'button',
+            {
+              key: 'd',
+              className: 'dshmem-tab',
+              'data-on': tab === 'transfer' ? '1' : '0',
+              onClick: () => {
+                setTab('transfer')
+                if (transferFiles === null) void loadTransfer()
+                if (sessionList === null) void loadSessions()
+              },
+            },
+            '数据',
           ),
         ]),
         info,
@@ -1025,6 +1228,235 @@ window.__ModuleLoader__.load({
       const proposedRow = sessionDraft !== null && Array.isArray(sessionDraft.proposed) && sessionDraft.proposed.length > 0 ? sessionDraft.proposed[0] : null
       const proposedText = proposedRow === null ? '' : String(proposedRow.content ?? '')
       const absorbedCount = sessionDraft === null ? 0 : sessionDraft.evaluation.removed.length
+      const choiceBtn = (key, label, active, onClick) => h(
+        'button',
+        { key, className: active ? 'dshmem-btn primary' : 'dshmem-btn', onClick, disabled: transferBusy },
+        label,
+      )
+      const profilePointTotal = Object.values(draft.sections ?? {}).reduce((total, list) => total + (Array.isArray(list) ? list.length : 0), 0)
+      const exportEstimate = estimateExport(
+        sessionList ?? [],
+        exportCfg.scope === 'sessions' ? exportCfg.picked : null,
+        exportCfg.profile,
+        profilePointTotal,
+      )
+      const planLines = describeImportPlan(importPlan === null ? null : importPlan.plan)
+      const kb = (bytes) => `${(Number(bytes || 0) / 1024).toFixed(1)} KB`
+
+      const transferBody = h(
+        'div',
+        null,
+        h('div', { className: transferBusy ? 'dshmem-warn' : 'dshmem-meta' }, transferNote),
+
+        h(
+          'section',
+          { className: 'dshmem-sec' },
+          h('header', null, h('h4', null, '导出'), h('span', { className: 'dshmem-meta' }, '写出一个带校验和的 JSON bundle')),
+          h(
+            'div',
+            { className: 'dshmem-bar' },
+            choiceBtn('scope-all', '全量', exportCfg.scope === 'all', () => setExportCfg({ ...exportCfg, scope: 'all' })),
+            choiceBtn('scope-profile', '仅画像', exportCfg.scope === 'profile', () => setExportCfg({ ...exportCfg, scope: 'profile' })),
+            choiceBtn('scope-sessions', '仅会话', exportCfg.scope === 'sessions', () => {
+              setExportCfg({ ...exportCfg, scope: 'sessions' })
+              if (sessionList === null) void loadSessions()
+            }),
+            h('label', { className: 'dshmem-meta' }, h('input', {
+              type: 'checkbox',
+              checked: exportCfg.profile,
+              onChange: (event) => setExportCfg({ ...exportCfg, profile: event.target.checked }),
+            }), ' 包含画像'),
+            h('input', {
+              placeholder: '关键词（可选）',
+              value: exportCfg.query,
+              onChange: (event) => setExportCfg({ ...exportCfg, query: event.target.value }),
+              style: { width: '160px' },
+            }),
+          ),
+          exportCfg.scope === 'sessions'
+            ? h(
+                'div',
+                { className: 'dshmem-list', style: { maxHeight: '180px' } },
+                (sessionList ?? []).length === 0
+                  ? h('div', { className: 'dshmem-empty' }, sessionList === null ? '（正在读取会话列表…）' : '（没有会话）')
+                  : (sessionList ?? []).map((row) => h(
+                      'label',
+                      { className: 'dshmem-row', key: row.sessionId },
+                      h('input', {
+                        type: 'checkbox',
+                        checked: exportCfg.picked.includes(row.sessionId),
+                        onChange: (event) => setExportCfg({
+                          ...exportCfg,
+                          picked: event.target.checked
+                            ? [...exportCfg.picked, row.sessionId]
+                            : exportCfg.picked.filter((id) => id !== row.sessionId),
+                        }),
+                      }),
+                      h('span', { className: 'dshmem-meta' }, ` ${row.title ?? '(无标题)'} · ${row.count} 条 · ${kb(row.bytes)} · ${row.sessionId.slice(0, 16)}`),
+                    )),
+              )
+            : null,
+          h(
+            'div',
+            { className: 'dshmem-bar' },
+            h('span', { className: 'dshmem-meta' }, `预估：${exportEstimate.sessions} 个会话 · ${exportEstimate.memories} 条记忆 · 正文 ${kb(exportEstimate.contentBytes)} → 包体约 ${kb(exportEstimate.estimateBytes)}`),
+            h('button', { className: 'dshmem-btn', onClick: () => void loadSessions(), disabled: transferBusy }, '刷新会话列表'),
+          ),
+          h(
+            'div',
+            { className: 'dshmem-bar' },
+            choiceBtn('dest-transfer', '保存到交换目录', exportCfg.destMode === 'transfer', () => setExportCfg({ ...exportCfg, destMode: 'transfer' })),
+            choiceBtn('dest-custom', '自定义路径', exportCfg.destMode === 'custom', () => setExportCfg({ ...exportCfg, destMode: 'custom' })),
+            exportCfg.destMode === 'custom'
+              ? h('input', {
+                  placeholder: '~/Desktop/mem.json',
+                  value: exportCfg.dest,
+                  onChange: (event) => setExportCfg({ ...exportCfg, dest: event.target.value }),
+                  style: { width: '260px' },
+                })
+              : h('span', { className: 'dshmem-meta' }, '导入可直接按文件名引用'),
+          ),
+          exportCfg.destMode === 'custom' && destHint(exportCfg.dest).length > 0
+            ? h('div', { className: 'dshmem-meta' }, destHint(exportCfg.dest))
+            : null,
+          h(
+            'div',
+            { className: 'dshmem-bar' },
+            h('label', { className: 'dshmem-meta' }, h('input', {
+              type: 'checkbox',
+              checked: exportCfg.overwrite,
+              onChange: (event) => setExportCfg({ ...exportCfg, overwrite: event.target.checked }),
+            }), ' 覆盖已存在文件'),
+            h('label', { className: 'dshmem-meta' }, h('input', {
+              type: 'checkbox',
+              checked: exportCfg.reveal,
+              onChange: (event) => setExportCfg({ ...exportCfg, reveal: event.target.checked }),
+            }), ' 导出后在访达中定位'),
+            h('span', { style: { flex: 1 } }),
+            h('button', { className: 'dshmem-btn primary', onClick: () => void runExport(), disabled: transferBusy }, transferBusy ? '处理中…' : '生成导出'),
+          ),
+          exportResult === null
+            ? null
+            : h(
+                'div',
+                { className: 'dshmem-entry' },
+                h('div', { className: 'dshmem-ok' }, `已导出 ${exportResult.file}`),
+                h('div', { className: 'dshmem-meta' }, exportResult.path),
+                h('div', { className: 'dshmem-meta' }, `${kb(exportResult.bytes)} · ${exportResult.counts.sessions} 会话 / ${exportResult.counts.memories} 记忆 / ${exportResult.counts.globalEntries} 条目${exportResult.revealed ? ' · 已在访达中定位' : ''}`),
+                h('div', { className: 'dshmem-meta' }, exportResult.checksum),
+                h('div', { className: 'dshmem-bar' },
+                  h('button', {
+                    className: 'dshmem-btn',
+                    onClick: () => {
+                      try { void navigator.clipboard.writeText(exportResult.path) } catch { /* clipboard may be unavailable */ }
+                      setTransferNote('路径已复制到剪贴板')
+                    },
+                  }, '复制路径'),
+                ),
+              ),
+        ),
+
+        h(
+          'section',
+          { className: 'dshmem-sec' },
+          h('header', null, h('h4', null, '导入'), h('span', { className: 'dshmem-meta' }, '先检查、后确认；写入前自动快照')),
+          h(
+            'div',
+            { className: 'dshmem-bar' },
+            choiceBtn('src-transfer', '交换目录', importPick.mode === 'transfer', () => setImportPick({ ...importPick, mode: 'transfer' })),
+            choiceBtn('src-path', '绝对路径', importPick.mode === 'path', () => setImportPick({ ...importPick, mode: 'path' })),
+            importPick.mode === 'transfer'
+              ? h(
+                  'select',
+                  {
+                    value: importPick.file,
+                    onChange: (event) => { setImportPick({ ...importPick, file: event.target.value }); setImportPlan(null); setImportArm(false) },
+                    style: { minWidth: '280px' },
+                  },
+                  [h('option', { key: '', value: '' }, '（选择 bundle）'), ...(transferFiles ?? []).map((file) => h('option', { key: file.file, value: file.file }, `${file.file} · ${kb(file.size)}`))],
+                )
+              : h('input', {
+                  placeholder: '~/Desktop/mem.json',
+                  value: importPick.path,
+                  onChange: (event) => { setImportPick({ ...importPick, path: event.target.value }); setImportPlan(null); setImportArm(false) },
+                  style: { width: '300px' },
+                }),
+            h('button', { className: 'dshmem-btn', onClick: () => void loadTransfer(), disabled: transferBusy }, '刷新列表'),
+          ),
+          h(
+            'div',
+            { className: 'dshmem-bar' },
+            h('span', { className: 'dshmem-meta' }, '已存在会话时：'),
+            choiceBtn('on-merge', '合并', importCfg.onExisting === 'merge', () => { setImportCfg({ ...importCfg, onExisting: 'merge' }); setImportPlan(null); setImportArm(false) }),
+            choiceBtn('on-skip', '跳过', importCfg.onExisting === 'skip', () => { setImportCfg({ ...importCfg, onExisting: 'skip' }); setImportPlan(null); setImportArm(false) }),
+            choiceBtn('on-replace', '替换', importCfg.onExisting === 'replace', () => { setImportCfg({ ...importCfg, onExisting: 'replace' }); setImportPlan(null); setImportArm(false) }),
+            h('label', { className: 'dshmem-meta' }, h('input', {
+              type: 'checkbox',
+              checked: importCfg.remapSessions,
+              onChange: (event) => { setImportCfg({ ...importCfg, remapSessions: event.target.checked }); setImportPlan(null); setImportArm(false) },
+            }), ' 重映射 sessionId（并存）'),
+            h('label', { className: 'dshmem-meta' }, h('input', {
+              type: 'checkbox',
+              checked: importCfg.replaceProfile,
+              onChange: (event) => setImportCfg({ ...importCfg, replaceProfile: event.target.checked }),
+            }), ' 整块替换画像'),
+          ),
+          h(
+            'div',
+            { className: 'dshmem-bar' },
+            h('button', { className: 'dshmem-btn', onClick: () => void checkImport(), disabled: transferBusy }, '检查'),
+            h('button', {
+              className: importArm ? 'dshmem-btn dshmem-del' : 'dshmem-btn primary',
+              onClick: () => void runImport(),
+              disabled: transferBusy || importPlan === null,
+            }, importArm ? '确认导入' : '导入'),
+            h('span', { className: 'dshmem-meta' }, importPlan === null ? '需先「检查」' : '检查通过，可导入'),
+          ),
+          importPlan === null
+            ? null
+            : h(
+                'div',
+                { className: 'dshmem-entry' },
+                h('div', { className: 'dshmem-meta' }, `来源 ${importPlan.source.plugin} ${importPlan.source.version} · 导出于 ${importPlan.exportedAt}`),
+                h('div', { className: 'dshmem-meta' }, `计数：${importPlan.counts.sessions} 会话 / ${importPlan.counts.memories} 记忆 / ${importPlan.counts.globalEntries} 条目 · 校验和通过`),
+                ...planLines.map((line, index) => h('div', { className: 'dshmem-meta', key: `plan-${index}` }, line)),
+              ),
+          importResult === null
+            ? null
+            : h(
+                'div',
+                { className: 'dshmem-entry' },
+                h('div', { className: 'dshmem-ok' }, `导入完成 · 快照 ${importResult.snapshot}`),
+                h('div', { className: 'dshmem-meta' }, `新建 ${importResult.report.created.length} · 合并 ${importResult.report.merged.length} · 跳过 ${importResult.report.skipped.length} · 替换 ${importResult.report.replaced.length} · 拒绝 ${importResult.report.rejected.length}`),
+                h('div', { className: 'dshmem-meta' }, `画像：新增 ${importResult.report.profileAdded} · 跳过 ${importResult.report.profileSkipped}${importResult.report.profileReplaced ? ' · 已整块替换' : ''} · 补建条目 ${importResult.report.entriesBuilt.length} · 重映射 ${importResult.report.remapped.length}`),
+                h('div', { className: importResult.audit.missingEntries + importResult.audit.orphanEntries === 0 ? 'dshmem-ok' : 'dshmem-warn' }, `契约校验：缺条目 ${importResult.audit.missingEntries} · 孤儿 ${importResult.audit.orphanEntries}`),
+                ...importResult.report.rejected.map((row, index) => h('div', { className: 'dshmem-warn', key: `rej-${index}` }, `拒绝 ${row.sessionId}：${row.reason}`)),
+                h('div', { className: 'dshmem-bar' },
+                  h('button', { className: 'dshmem-btn dshmem-del', onClick: () => void rollbackTransfer(importResult.snapshot), disabled: transferBusy }, '回滚本次导入'),
+                ),
+              ),
+        ),
+
+        h(
+          'section',
+          { className: 'dshmem-sec' },
+          h('header', null, h('h4', null, '导入快照'), h('span', { className: 'dshmem-meta' }, '可回滚；写入前生成')),
+          (snapshots ?? []).length === 0
+            ? h('div', { className: 'dshmem-empty' }, snapshots === null ? '（正在读取…）' : '（暂无快照）')
+            : (snapshots ?? []).map((row) => h(
+                'div',
+                { className: 'dshmem-row', key: row.snapshot },
+                h('div', { style: { flex: 1, minWidth: 0 } },
+                  h('div', null, row.snapshot),
+                  h('div', { className: 'dshmem-meta' }, `${row.at === null ? '—' : new Date(row.at).toLocaleString()} · ${row.files} 个文件 · 含 ${row.sessions} 个会话 · 新建 ${row.created}`),
+                ),
+                row.rollbackable
+                  ? h('button', { className: 'dshmem-btn', onClick: () => void rollbackTransfer(row.snapshot), disabled: transferBusy }, '回滚')
+                  : h('span', { className: 'dshmem-meta' }, '不可回滚（无 manifest）'),
+              )),
+        ),
+      )
+
       const pendingMemoryIds = new Set(memoryRemovals.map((row) => row.memoryId))
       const pendingSessionIds = new Set(sessionRemovals)
 
@@ -1245,7 +1677,9 @@ window.__ModuleLoader__.load({
               ? injectBody
               : tab === 'sessions'
                 ? sessionsBody
-                : tidyBody,
+                : tab === 'transfer'
+                  ? transferBody
+                  : tidyBody,
         h(
           'div',
           { className: 'dshmem-bar' },
@@ -1296,6 +1730,7 @@ window.__ModuleLoader__.load({
       )
     }
 
+    exports.__internals = { estimateExport, describeImportPlan, destHint }
     exports.apply = apply
     exports.inject = ['slots']
     return module.exports
