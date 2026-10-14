@@ -1,4 +1,4 @@
-> **本插件全程由 dsh + ds4.1flash 开发与维护：100% 纯 AI 生成，人工代码 0 添加。**
+> **本插件全程由 DeepSeek Harness（DSH）+ DeepSeek V4.1 Flash 开发与维护：100% 纯 AI 生成，人工代码 0 添加。**
 
 # dsh-structured-memory
 
