@@ -1,27 +1,27 @@
 /**
- * dsh-memory client half (v2.5): the memory store editor shown as this plugin's
+ * dsh-structured-memory client half (v2.5): the memory store editor shown as this plugin's
  * row configuration on the Plugins page.
  *
  * Written in the module-loader format the browser half expects, so the bundle
  * needs no build step: `window.__ModuleLoader__.load({ id, factory })` with
  * `require` for the shared client packages. The row config slot is keyed by
  * `<package name>#<row id from cordis.patch.yml>` (see ui-plugin-manager's
- * rowConfigKey), i.e. "dsh-memory#dsh-memory".
+ * rowConfigKey), i.e. "dsh-structured-memory#dsh-structured-memory".
  *
  * All reads and writes go to the plugin's own loopback bridge
- * (/api/dsh-memory-store); memory JSON stays the single source of truth.
+ * (/api/dsh-structured-memory-store); memory JSON stays the single source of truth.
  */
 window.__ModuleLoader__.load({
-  id: 'dsh-memory',
+  id: 'dsh-structured-memory',
   factory: (require) => {
     const module = { exports: {} }
     const exports = module.exports
     const react = require('react')
     const h = react.createElement
 
-    const BRIDGE = '/api/dsh-memory-store'
-    const CONSOLIDATE = '/api/dsh-memory-consolidate'
-    const TRANSFER = '/api/dsh-memory-transfer'
+    const BRIDGE = '/api/dsh-structured-memory-store'
+    const CONSOLIDATE = '/api/dsh-structured-memory-consolidate'
+    const TRANSFER = '/api/dsh-structured-memory-transfer'
     const SECTIONS = [
       ['identity', '身份'],
       ['work', '工作'],
@@ -29,7 +29,7 @@ window.__ModuleLoader__.load({
       ['technical', '技术'],
       ['style', '风格'],
     ]
-    const STYLE_ID = 'dsh-memory-config-style'
+    const STYLE_ID = 'dsh-structured-memory-config-style'
 
     const CSS = [
       '.dshmem{font-family:-apple-system,"SF Pro Text","PingFang SC",system-ui,sans-serif;font-size:13px;line-height:1.55;display:flex;flex-direction:column;gap:10px;color:inherit}',
@@ -1816,7 +1816,7 @@ function destHint(value) {
       ensureStyle()
       ctx.slots.inject('plugins.row.config', () =>
         ctx.slots.register(
-          { name: 'plugins.row.config', key: 'dsh-memory#dsh-memory' },
+          { name: 'plugins.row.config', key: 'dsh-structured-memory#dsh-structured-memory' },
           RowConfig,
         ),
       )

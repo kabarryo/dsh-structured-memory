@@ -1,5 +1,5 @@
 /**
- * dsh-memory search index (v2.2): FTS5 full-text retrieval over session
+ * dsh-structured-memory search index (v2.2): FTS5 full-text retrieval over session
  * memories, backed by node:sqlite (zero new dependencies).
  *
  * Design:
@@ -12,7 +12,7 @@
  *     or locked, methods degrade silently (search → empty, upsert/delete →
  *     no-op) and the plugin keeps working with substring recall.
  *
- * @module dsh-memory-search
+ * @module dsh-structured-memory-search
  */
 
 const MEMORY_SEARCH_APPLICATION_ID = 0x44534d31 // 'DSM1' — guard against cross-app reuse
@@ -41,12 +41,37 @@ export async function openSearchIndex({ memoryDir }) {
       + 'sessionId TEXT,'
       + 'category TEXT,'
       + 'createdAt INTEGER)')
+    // v2.20: `files` is a new column on the derived index. The store is
+    // rebuildable, so a stale table is dropped and recreated instead of migrated
+    // in place; getSearchIndex() awaits rebuild() right after opening.
+    try { db.exec('ALTER TABLE mem_meta ADD COLUMN files TEXT') } catch { /* already present */ }
     db.exec("CREATE VIRTUAL TABLE IF NOT EXISTS mem_idx USING fts5("
-      + "content, sessionId UNINDEXED, memoryId UNINDEXED, category UNINDEXED, createdAt UNINDEXED,"
+      + "content, files, sessionId UNINDEXED, memoryId UNINDEXED, category UNINDEXED, createdAt UNINDEXED,"
       + " tokenize='trigram')")
+    const indexColumns = (() => {
+      try { return db.prepare('PRAGMA table_info(mem_idx)').all().map((row) => String(row.name)) } catch { return [] }
+    })()
+    if (!indexColumns.includes('files')) {
+      db.exec('DROP TABLE mem_idx')
+      db.exec("CREATE VIRTUAL TABLE mem_idx USING fts5("
+        + "content, files, sessionId UNINDEXED, memoryId UNINDEXED, category UNINDEXED, createdAt UNINDEXED,"
+        + " tokenize='trigram')")
+    }
   } catch {
     try { db?.close() } catch { /* ignore */ }
     return null
+  }
+
+  /** One path per line: the indexed text form of a file list (actions stay in mem_meta). */
+  function filesText(files) {
+    if (!Array.isArray(files)) return ''
+    return files
+      .map((file) => {
+        if (typeof file === 'string') return file
+        return file !== null && typeof file === 'object' && typeof file.path === 'string' ? file.path : ''
+      })
+      .filter((path) => path.length > 0)
+      .join('\n')
   }
 
   /** Empty the index (used by rebuild). */
@@ -56,15 +81,15 @@ export async function openSearchIndex({ memoryDir }) {
   }
 
   /** Insert or replace one memory row. Safe to call repeatedly (idempotent). */
-  const upsert = ({ sessionId, memoryId, category, content, createdAt }) => {
+  const upsert = ({ sessionId, memoryId, category, content, createdAt, files }) => {
     try {
       const text = String(content ?? '')
       if (!text.trim()) return
       db.prepare('DELETE FROM mem_idx WHERE memoryId = ?').run(String(memoryId ?? ''))
-      db.prepare('INSERT OR REPLACE INTO mem_meta (memoryId, sessionId, category, createdAt)'
-        + ' VALUES (?, ?, ?, ?)').run(String(memoryId ?? ''), String(sessionId ?? ''), String(category ?? 'general'), Number(createdAt ?? 0))
-      db.prepare('INSERT INTO mem_idx (content, sessionId, memoryId, category, createdAt)'
-        + ' VALUES (?, ?, ?, ?, ?)').run(text, String(sessionId ?? ''), String(memoryId ?? ''), String(category ?? 'general'), Number(createdAt ?? 0))
+      db.prepare('INSERT OR REPLACE INTO mem_meta (memoryId, sessionId, category, createdAt, files)'
+        + ' VALUES (?, ?, ?, ?, ?)').run(String(memoryId ?? ''), String(sessionId ?? ''), String(category ?? 'general'), Number(createdAt ?? 0), JSON.stringify(Array.isArray(files) ? files : []))
+      db.prepare('INSERT INTO mem_idx (content, files, sessionId, memoryId, category, createdAt)'
+        + ' VALUES (?, ?, ?, ?, ?, ?)').run(text, filesText(files), String(sessionId ?? ''), String(memoryId ?? ''), String(category ?? 'general'), Number(createdAt ?? 0))
     } catch {
       /* degrade silently */
     }
@@ -115,8 +140,8 @@ export async function openSearchIndex({ memoryDir }) {
         files = []
       }
       clear()
-      const stmtMeta = db.prepare('INSERT OR REPLACE INTO mem_meta (memoryId, sessionId, category, createdAt) VALUES (?, ?, ?, ?)')
-      const stmtIdx = db.prepare('INSERT INTO mem_idx (content, sessionId, memoryId, category, createdAt) VALUES (?, ?, ?, ?, ?)')
+      const stmtMeta = db.prepare('INSERT OR REPLACE INTO mem_meta (memoryId, sessionId, category, createdAt, files) VALUES (?, ?, ?, ?, ?)')
+      const stmtIdx = db.prepare('INSERT INTO mem_idx (content, files, sessionId, memoryId, category, createdAt) VALUES (?, ?, ?, ?, ?, ?)')
       for (const file of files) {
         let doc
         try {
@@ -129,8 +154,8 @@ export async function openSearchIndex({ memoryDir }) {
         for (const m of memories) {
           if (!m || typeof m.content !== 'string' || !m.content.trim()) continue
           sawMemories = true
-          stmtMeta.run(String(m.id ?? ''), sid, String(m.category ?? 'general'), Number(m.createdAt ?? 0))
-          stmtIdx.run(String(m.content), sid, String(m.id ?? ''), String(m.category ?? 'general'), Number(m.createdAt ?? 0))
+          stmtMeta.run(String(m.id ?? ''), sid, String(m.category ?? 'general'), Number(m.createdAt ?? 0), JSON.stringify(Array.isArray(m.files) ? m.files : []))
+          stmtIdx.run(String(m.content), filesText(m.files), sid, String(m.id ?? ''), String(m.category ?? 'general'), Number(m.createdAt ?? 0))
           inserted += 1
         }
       }
@@ -161,7 +186,7 @@ export async function openSearchIndex({ memoryDir }) {
     ].filter(Boolean)
     const tail = conds.length > 0 ? ` AND ${conds.join(' AND ')}` : ''
     const args = [category ? category.toLowerCase() : null, opts.sessionId ? String(opts.sessionId) : null].filter((v) => v !== null)
-    const projection = 'content, sessionId, memoryId, category, createdAt'
+    const projection = 'content, files, sessionId, memoryId, category, createdAt'
 
     // FTS5 path: requires >= 3 characters (trigram granularity) plus a
     // succeed-with-results guarantee; otherwise LIKE is at least as good.
@@ -181,8 +206,8 @@ export async function openSearchIndex({ memoryDir }) {
     // can detect the outage and fall back to scanning the JSON source of truth.
     try {
       const rows = db.prepare(
-        `SELECT ${projection} FROM mem_idx WHERE content LIKE ?${tail} ORDER BY createdAt DESC LIMIT ?`
-      ).all(`%${q}%`, ...args, limit)
+        `SELECT ${projection} FROM mem_idx WHERE (content LIKE ? OR files LIKE ?)${tail} ORDER BY createdAt DESC LIMIT ?`
+      ).all(`%${q}%`, `%${q}%`, ...args, limit)
       return rows
     } catch (err) {
       throw err

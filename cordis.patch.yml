@@ -1,8 +1,8 @@
-# dsh-memory bundle patch: mounts the memory plugin into any profile that
+# dsh-structured-memory bundle patch: mounts the memory plugin into any profile that
 # lists this bundle.
 - insert:
-    - id: dsh-memory
-      name: dsh-memory
+    - id: dsh-structured-memory
+      name: dsh-structured-memory
       config:
         maxMemoriesPerSession: 1000
         injectLimit: 20

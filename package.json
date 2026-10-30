@@ -1,9 +1,21 @@
 {
   "name": "dsh-structured-memory",
-  "version": "2.19.5",
+  "version": "2.22.0",
   "description": "Persistent cross-session memory for DSH: user profile + global compact index (runtime-context injected) + on-demand session memories, FTS5 search, auto backup, export/import bundles with checksums and rollback, fork lineage, read-only memory for subagents, and a six-tab Plugins-page editor.",
   "license": "MIT",
+  "author": "kabarryo",
+  "homepage": "https://github.com/kabarryo/dsh-structured-memory#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/kabarryo/dsh-structured-memory.git"
+  },
+  "bugs": {
+    "url": "https://github.com/kabarryo/dsh-structured-memory/issues"
+  },
   "type": "module",
+  "scripts": {
+    "test": "node --import ./tests/lib/register.mjs ./tests/run.mjs"
+  },
   "main": "index.js",
   "exports": {
     ".": "./index.js",
@@ -14,6 +26,7 @@
     "index.js",
     "client.js",
     "search-index.js",
+    "skill.js",
     "cordis.patch.yml",
     "README.md",
     "LICENSE"
@@ -70,14 +83,5 @@
     "react": {
       "optional": true
     }
-  },
-  "author": "kabarryo",
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/kabarryo/dsh-structured-memory.git"
-  },
-  "homepage": "https://github.com/kabarryo/dsh-structured-memory#readme",
-  "bugs": {
-    "url": "https://github.com/kabarryo/dsh-structured-memory/issues"
   }
 }

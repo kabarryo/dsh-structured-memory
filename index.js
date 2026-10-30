@@ -1,5 +1,5 @@
 /**
- * dsh-memory v2.2 — two-tier cross-session memory + user profile + FTS5 search + auto backup.
+ * dsh-structured-memory v2.2 — two-tier cross-session memory + user profile + FTS5 search + auto backup.
  *
  * Storage:
  *
@@ -54,7 +54,7 @@
  * once at startup when `migration` is enabled; the old file is renamed with a
  * .migrated-<ts> suffix (no data loss, no re-migration).
  *
- * @module dsh-memory
+ * @module dsh-structured-memory
  */
 
 import { mkdir, readFile, writeFile, rename, readdir, copyFile, rm, stat } from 'node:fs/promises'
@@ -67,6 +67,7 @@ import z from '@deepseek-ai/schemastery'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { createUserMessage, BlockAssembler } from '@deepseek-ai/dsh-llm'
 import { openSearchIndex } from './search-index.js'
+import { MEMORY_SKILL } from './skill.js'
 
 export const name = 'dsh-structured-memory'
 export const inject = ['agents', 'tools', 'systemPrompt']
@@ -91,9 +92,9 @@ const DEFAULT_INHERIT_FORK_MEMORY = true
  */
 export const SAVE_MEMORY_CONTENT_RULE = "HIERARCHY: injected profile/index -> this entry's keyPoint -> this memory's content -> the process document (if any). Each level is read only when the level above cannot answer — so the keyPoint must be a dense conclusion that tells the reader whether to open this memory, and MUST NOT contain document locations or paths (the document pointer belongs in the content). CONTENT RULE: this session keeps ONE memory, and that memory is a durable reference — keep it to conclusions, current state, trade-offs that cannot be re-derived, coordinates (paths, commands, numbers) and a pointer to where the process record lives (a project document or repository file). Process narrative, measured figures, pitfall stories, changelogs and commit hashes belong in that document, NOT here; write the pointer once instead of copying the detail." 
 /* ------------------------- transfer (export / import) -------------------- */
-const TRANSFER_PATH = '/api/dsh-memory-transfer'
+const TRANSFER_PATH = '/api/dsh-structured-memory-transfer'
 const TRANSFER_DIR = 'transfer'
-const PLUGIN_VERSION = '2.19.5'
+const PLUGIN_VERSION = '2.22.0'
 const EXPORT_KIND = 'dsh-structured-memory-export'
 const EXPORT_FORMAT = 1
 const TRANSFER_MAX_BYTES = 5 * 1024 * 1024
@@ -197,6 +198,7 @@ export function buildExportBundle({ version, profile, entries, sessions, options
         createdAt: Number.isFinite(memory.createdAt) ? memory.createdAt : Date.now(),
         ...(Number.isFinite(memory.updatedAt) ? { updatedAt: memory.updatedAt } : {}),
         ...(Number.isFinite(memory.mergedCount) ? { mergedCount: memory.mergedCount } : {}),
+        ...(Array.isArray(memory.files) && memory.files.length > 0 ? { files: memory.files } : {}),
       })),
     })),
   }
@@ -272,6 +274,33 @@ const DEFAULT_SUBAGENT_MEMORY_READ_ONLY = true
  * remembering" is not a trigger, and that is what curbs mis-triggered saves.
  */
 const SAVE_TRIGGERS = ['user-request', 'acceptance', 'decision', 'correction']
+/**
+ * Closed vocabulary for a memory's category (v2.21). Model-originated writes are
+ * normalized onto it; stored and imported values are never rewritten (the editor
+ * stays a free-form escape hatch, and old data keeps its label).
+ */
+export const MEMORY_CATEGORIES = ['decision', 'bugfix', 'security', 'preference', 'general']
+
+/** The order that decides which type survives a synthesis (most consequential first). */
+const CATEGORY_PRIORITY = ['security', 'decision', 'bugfix', 'preference', 'general']
+
+/** Aliases accepted from the model, including the free labels earlier versions used. */
+const CATEGORY_ALIASES = {
+  decision: 'decision', '决策': 'decision', '决定': 'decision', '取舍': 'decision',
+  bugfix: 'bugfix', bug: 'bugfix', fix: 'bugfix', '修复': 'bugfix', '缺陷': 'bugfix',
+  security: 'security', '安全': 'security', '隐私': 'security',
+  preference: 'preference', preferences: 'preference', style: 'preference',
+  '偏好': 'preference', '习惯': 'preference', '风格': 'preference',
+  general: 'general', '通用': 'general', '其他': 'general',
+}
+
+/** Normalize a model-originated category; unknown labels fall back. */
+export function normalizeCategory(raw, fallback = DEFAULT_CATEGORY) {
+  const key = String(raw ?? '').trim().toLowerCase()
+  if (key.length === 0) return fallback
+  return CATEGORY_ALIASES[key] ?? fallback
+}
+
 /** Every trigger except an explicit user request must cite an anchor (v2.4). */
 const EVIDENCE_REQUIRED_TRIGGERS = ['acceptance', 'decision', 'correction']
 /** Auto-saves must cite evidence unless this is turned off. */
@@ -341,7 +370,7 @@ function noteMemoryRoot(config) {
     const legacy = resolve(stateDir, '.dsh', 'memory')
     if (legacy !== root && existsSync(legacy)) {
       console.error(
-        `[dsh-memory] stray store at ${legacy}; active memory root is ${root}`,
+        `[dsh-structured-memory] stray store at ${legacy}; active memory root is ${root}`,
       )
     }
   } catch {
@@ -402,7 +431,7 @@ async function readJson(path, fallback) {
 /** Atomically persist JSON (write temp + rename). */
 async function writeJson(path, value) {
   await mkdir(dirname(path), { recursive: true })
-  const tmp = resolve(tmpdir(), `dsh-memory-${randomUUID()}.json`)
+  const tmp = resolve(tmpdir(), `dsh-structured-memory-${randomUUID()}.json`)
   await writeFile(tmp, JSON.stringify(value, null, 2), 'utf8')
   await rename(tmp, path)
 }
@@ -531,12 +560,11 @@ function pickInjection(profile, globalEntries, injectLimit, maxInjectBytes) {
     const candidate = join([profileText, variant])
     if (bytes(candidate) <= maxInjectBytes) return { profilePart: profileText ?? '', indexPart: variant, text: candidate }
   }
-  // Even the stub does not fit: trim the profile down and keep the stub, because a
-  // silently dropped index is exactly how memories become undiscoverable.
+  // Even the stub does not fit: shrink the profile (points, never its tags) and
+  // keep the stub, because a silently dropped index is exactly how memories
+  // become undiscoverable.
   const stub = variants[variants.length - 1]
-  let profilePart = typeof profileText === 'string' ? profileText : ''
-  const lines = profilePart.split('\n')
-  if (lines.length > 9) profilePart = [...lines.slice(0, 3), '  - …', ...lines.slice(-2)].join('\n')
+  const profilePart = renderUserProfile(profile, { maxPointsPerSection: 1 }) ?? ''
   return { profilePart, indexPart: stub, text: join([profilePart, stub]) }
 }
 
@@ -683,11 +711,11 @@ async function getSearchIndex(config) {
 }
 
 /** Upsert one memory record into the search index (no-op when unavailable). */
-async function indexUpsert(config, { sessionId, memoryId, category, content, createdAt }) {
+async function indexUpsert(config, { sessionId, memoryId, category, content, createdAt, files }) {
   try {
     const index = await getSearchIndex(config)
     if (index === null) return
-    index.upsert({ sessionId, memoryId, category, content, createdAt })
+    index.upsert({ sessionId, memoryId, category, content, createdAt, files })
   } catch {
     /* degrade silently */
   }
@@ -720,6 +748,38 @@ async function indexSearch(config, query, opts) {
 }
 
 /* ---------------------------- backup (v2.2) ------------------------------- */
+
+/** Path of the bounded correction audit log. */
+function correctionsLogPathOf(root) {
+  return join(root, 'corrections-log.json')
+}
+
+/**
+ * Append one audit row (newest first, bounded). Best effort: an audit failure
+ * must never fail the correction that already succeeded on disk.
+ */
+async function recordCorrection(config, row) {
+  try {
+    const path = correctionsLogPathOf(memoryRootOf(config))
+    const existing = await readJson(path, [])
+    const rows = Array.isArray(existing) ? existing : []
+    rows.unshift(row)
+    await writeJson(path, rows.slice(0, CORRECTIONS_LOG_LIMIT))
+  } catch {
+    /* audit is best effort */
+  }
+}
+
+/** Copy the pre-correction session file into memory-backup/corrections/. */
+async function snapshotSessionForCorrection(config, sessionId) {
+  const root = memoryRootOf(config)
+  const dir = join(root, 'memory-backup', 'corrections')
+  await mkdir(dir, { recursive: true })
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-')
+  const name = `${stamp}-${safeSessionId(sessionId)}.json`
+  await copyFile(sessionPathOf(root, sessionId), join(dir, name))
+  return name
+}
 
 /** Copy profile/global/sessions into memory-backup/YYYY-MM-DD/. */
 async function runBackup(config) {
@@ -952,15 +1012,23 @@ function renderSessionMemory(doc, sessionId) {
   ].join('\n')
 }
 
-/** Render the structured user profile as a compact injection block. */
-function renderUserProfile(profile) {
+/**
+ * Render the structured user profile as a compact injection block.
+ *
+ * `maxPointsPerSection` exists for the last-resort budget path: cutting the
+ * rendered block by line count could drop the opening `<user_profile>` tag and
+ * ship unbalanced markup, so pressure is absorbed by dropping points instead.
+ */
+function renderUserProfile(profile, { maxPointsPerSection = Number.POSITIVE_INFINITY } = {}) {
   if (!isRecord(profile) || !isRecord(profile.sections)) return undefined
   const lines = []
   for (const section of PROFILE_SECTIONS) {
     const points = Array.isArray(profile.sections[section]) ? profile.sections[section] : []
     if (points.length === 0) continue
-    const entries = points.map((p) => `  - ${String(p)}`).join('\n')
+    const shown = points.slice(0, maxPointsPerSection)
+    const entries = shown.map((p) => `  - ${String(p)}`).join('\n')
     lines.push(`[${section}]`, entries)
+    if (shown.length < points.length) lines.push('  - …')
   }
   if (lines.length === 0) return undefined
   return [
@@ -1035,13 +1103,78 @@ async function migrateLegacyConfig(config) {
 
 /* --------------------------------- tools -------------------------------- */
 
-function setupTools(ctx, config) {
+/**
+ * Register the retrieval skill (v2.20). The skills service is optional: without
+ * it the tools keep their long descriptions, so nothing is lost but tokens.
+ * A duplicate registration (plugin reload) throws in some hosts; that is a
+ * fallback case, not an error worth failing plugin startup over.
+ */
+export function registerMemorySkill(ctx) {
+  const skills = typeof ctx?.get === 'function' ? ctx.get('skills') : undefined
+  if (skills === undefined || skills === null || typeof skills.register !== 'function') return false
+  try {
+    const dispose = skills.register({
+      ...MEMORY_SKILL,
+      source: 'runtime',
+      invocation: { modelInvocable: true, userInvocable: true },
+    })
+    if (typeof ctx.effect === 'function' && typeof dispose === 'function') ctx.effect(() => dispose)
+    return true
+  } catch {
+    return false
+  }
+}
+
+/* --------------------- model-facing tool descriptions -------------------- */
+
+/**
+ * Full description of `save_memory` (the fallback when no skills service is
+ * available). Pre-v2.20 the literal `$${SAVE_MEMORY_CONTENT_RULE}`
+ * was never interpolated — it is a double-quoted string — so the model saw a
+ * placeholder instead of the content rule. The builder now appends the rule
+ * explicitly.
+ */
+const LONG_SAVE_DESCRIPTION = "Save a long-term memory that should persist across future sessions. The CURRENT session keeps exactly ONE memory: this call REWRITES that single memory (appending the new facts after deduplication) rather than creating an additional entry, and a compact global entry is maintained for the session. Call it again in the same session whenever new durable facts appear — nothing is duplicated and nothing is lost. CALL THIS TOOL ONLY WHEN ONE OF THESE EVENTS HAS ACTUALLY OCCURRED, and pass the matching trigger: 'user-request' — the user explicitly asked to remember something (记住/记一下/记下来/存一下/别忘了); 'acceptance' — the user explicitly accepted a deliverable (可以了/没问题/已生效/通过); 'decision' — this session settled a trade-off that cannot be re-derived from the repository, the docs, or the conversation; 'correction' — the user corrected an existing memory (pass supersedes with the stale fragment; add sessionId when the wrong memory belongs to a past session). DO NOT CALL IT because you are considering whether something is worth remembering, for intermediate progress, for unfinished TODOs, for content already readable in the repository/docs/context, or for unverified guesses; an explicit user request outranks that exclusion list. For 'acceptance'/'decision'/'correction' ALSO pass evidence — a verbatim user quote, or a verifiable artifact (path, command, hash, number); if no evidence can be cited, do not save. Provide keyPoint: an ultra-compact one-line summary (default ≤ 50 characters, the shorter the better without ambiguity; may extend to 100 characters only when it must keep un-truncatable tokens like serial numbers, keys, or addresses intact). PROFILES: while saving, judge whether the memory also conveys stable user-profile information (identity, work role, personal context, technical stack, communication style). If so, ALSO pass profileUpdate (one concise profile point) and profileSection (identity | work | personal | technical | style) so the global user profile stays current. Delegated subagents have READ-ONLY memory access — the delegating agent owns the write. "
+
+const LONG_RECALL_DESCRIPTION = "List or search saved long-term memories. scope 'profile' returns the global user profile only; scope 'global' returns the compact per-session index only; scope 'session' returns full session memories (optionally one session via sessionId); scope 'all' (default) merges profile + global + session. Note: full session memories (including the CURRENT session's) are NOT auto-injected into context — call this with a query whenever you need a detail recorded by save_memory, for this session or a past one. Optional query substring and category filters apply."
+
+const LONG_LOAD_DESCRIPTION = "Load a PAST session's FULL memory into the current conversation (on demand). Call this when the current topic relates to a session listed in the global memory index. The loaded memory is injected as context for subsequent steps."
+
+/** Compact forms: the gates stay inline, the protocol moves to MEMORY_SKILL. */
+const COMPACT_TOOL_DESCRIPTIONS = {
+  save: "Save a long-term memory that must survive this session. The session keeps exactly ONE memory: this call rewrites it (deduplicated append) and keeps its index entry — call again whenever new durable facts appear. CALL ONLY WHEN AN EVENT HAPPENED, passing that trigger: 'user-request' (user asked to remember), 'acceptance' (user accepted a deliverable), 'decision' (a trade-off was settled that cannot be re-derived), 'correction' (an existing memory was wrong — also pass supersedes with the stale fragment, and sessionId to fix a past session). acceptance/decision/correction also require evidence — a verbatim quote or a verifiable artifact (path, command, hash, number); without it, do not save. Never save progress, TODOs, repo/docs, or guesses. keyPoint: one dense conclusion, ≤50 chars (≤100 for unbreakable tokens); no document paths. files: paths this memory concerns. category: decision | bugfix | security | preference | general. PROFILES: also pass profileUpdate + profileSection (identity | work | personal | technical | style) when the memory carries stable user information. Subagents: read-only. <private>…</private> spans are removed before storage. Write conclusions and coordinates, not narrative. Retrieval protocol, content rule and cost per level: load the structured-memory skill.",
+  recall: "List or search saved long-term memories. scope: 'profile' | 'global' | 'session' | 'all' (default) | 'timeline' (sessions around an anchor). Full session memories are NOT auto-injected: query here for any detail, including this session's. File paths are indexed. Protocol: load the structured-memory skill.",
+  load: "Load a PAST session's FULL memory into this conversation (expensive — prefer recall_memory with a query first). Load the structured-memory skill for the retrieval protocol.",
+}
+
+/**
+ * Model-facing tool descriptions (v2.20).
+ *
+ * `save_memory` carried 2,009 characters in every request — and its trailing
+ * `${SAVE_MEMORY_CONTENT_RULE}` never expanded, so the 831-character content
+ * rule was dead text. With a skills service the long form moves into
+ * MEMORY_SKILL and only the gates stay inline; without one the full text is
+ * served with the rule properly interpolated.
+ */
+export function buildToolDescriptions({ skillGuide = false } = {}) {
+  if (!skillGuide) {
+    return {
+      save: `${LONG_SAVE_DESCRIPTION}${SAVE_MEMORY_CONTENT_RULE}`,
+      recall: LONG_RECALL_DESCRIPTION,
+      load: LONG_LOAD_DESCRIPTION,
+    }
+  }
+  return { ...COMPACT_TOOL_DESCRIPTIONS }
+}
+
+export function setupTools(ctx, config, { skillGuide = false } = {}) {
+  const descriptions = buildToolDescriptions({ skillGuide })
   const maxMemoriesPerSession = config.maxMemoriesPerSession ?? DEFAULT_MAX_MEMORIES_PER_SESSION
   const maxProfilePoints = config.maxProfilePoints ?? DEFAULT_MAX_PROFILE_POINTS
 
   const saveTool = defineTool({
     name: 'save_memory',
-    description: "Save a long-term memory that should persist across future sessions. The CURRENT session keeps exactly ONE memory: this call REWRITES that single memory (appending the new facts after deduplication) rather than creating an additional entry, and a compact global entry is maintained for the session. Call it again in the same session whenever new durable facts appear — nothing is duplicated and nothing is lost. CALL THIS TOOL ONLY WHEN ONE OF THESE EVENTS HAS ACTUALLY OCCURRED, and pass the matching trigger: 'user-request' — the user explicitly asked to remember something (记住/记一下/记下来/存一下/别忘了); 'acceptance' — the user explicitly accepted a deliverable (可以了/没问题/已生效/通过); 'decision' — this session settled a trade-off that cannot be re-derived from the repository, the docs, or the conversation; 'correction' — the user corrected an existing memory. DO NOT CALL IT because you are considering whether something is worth remembering, for intermediate progress, for unfinished TODOs, for content already readable in the repository/docs/context, or for unverified guesses; an explicit user request outranks that exclusion list. For 'acceptance'/'decision'/'correction' ALSO pass evidence — a verbatim user quote, or a verifiable artifact (path, command, hash, number); if no evidence can be cited, do not save. Provide keyPoint: an ultra-compact one-line summary (default ≤ 50 characters, the shorter the better without ambiguity; may extend to 100 characters only when it must keep un-truncatable tokens like serial numbers, keys, or addresses intact). PROFILES: while saving, judge whether the memory also conveys stable user-profile information (identity, work role, personal context, technical stack, communication style). If so, ALSO pass profileUpdate (one concise profile point) and profileSection (identity | work | personal | technical | style) so the global user profile stays current. Delegated subagents have READ-ONLY memory access — the delegating agent owns the write. ${SAVE_MEMORY_CONTENT_RULE}",
+    description: descriptions.save,
     parameters: {
       content: { type: 'string', required: true, description: "The full memory content to remember, in the user's own terms." },
       trigger: { type: 'string', required: true, description: "Why this save is happening — the occurred event: 'user-request' | 'acceptance' | 'decision' | 'correction'. Required; any other value is rejected." },
@@ -1051,6 +1184,27 @@ function setupTools(ctx, config) {
       title: { type: 'string', description: 'Optional human-readable title for this session in the global index. If omitted, the existing title is kept or derived.' },
       profileUpdate: { type: 'string', description: 'Optional concise user-profile point to merge into the global profile (e.g. "the user runs the release tooling"). Omit when the memory has no stable profile value.' },
       profileSection: { type: 'string', description: "Profile section for profileUpdate: identity | work | personal | technical | style. Required if profileUpdate is provided." },
+      supersedes: {
+        type: 'array',
+        description: "Corrections only: the stale fragment(s) to remove, one per entry. Every stored line whose normalized text contains a fragment is deleted, then `content` is appended as the corrected fact; a correction that matches nothing is refused.",
+        items: { type: 'string' },
+      },
+      sessionId: {
+        type: 'string',
+        description: 'Corrections only: the stored session whose memory is being corrected. Omit to correct the current session.',
+      },
+      files: {
+        type: 'array',
+        description: 'Files this memory concerns, so "which memory touched this file" stays answerable (the paths are full-text indexed). Omit when the memory has no file scope.',
+        items: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            path: { type: 'string', required: true },
+            action: { type: 'string', enum: ['read', 'modified'] },
+          },
+        },
+      },
     },
     output: {
       schema: {
@@ -1066,6 +1220,10 @@ function setupTools(ctx, config) {
           total: { type: 'number' },
           profileUpdated: { type: 'boolean' },
           profileSection: { type: 'string' },
+          fileCount: { type: 'number' },
+          redacted: { type: 'number' },
+          corrected: { type: 'boolean' },
+          removedLines: { type: 'number' },
         },
       },
       render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }],
@@ -1079,8 +1237,31 @@ function setupTools(ctx, config) {
       const sessionId = ownSessionId === null ? null : await resolveOwnerSessionId(config, exec.agent)
       const headerParent = exec.agent?.session?.header?.parentSession ?? null
       const store = memoryRootOf(config)
-      const content = String(args.content ?? '').trim()
-      if (!content) throw new Error('save_memory: content is required')
+      // v2.21: <private> spans exist in the conversation, never in the store.
+      const scrubbed = {
+        content: stripPrivateSpans(args.content),
+        keyPoint: stripPrivateSpans(args.keyPoint),
+        title: stripPrivateSpans(args.title),
+        profile: stripPrivateSpans(args.profileUpdate),
+      }
+      const scrubbedSupersedes = (Array.isArray(args.supersedes) ? args.supersedes : [])
+        .map((fragment) => stripPrivateSpans(fragment))
+      const supersedes = scrubbedSupersedes.map((row) => row.text.trim()).filter((row) => row.length > 0)
+      const redacted = scrubbed.content.removed + scrubbed.keyPoint.removed
+        + scrubbed.title.removed + scrubbed.profile.removed
+        + scrubbedSupersedes.reduce((total, row) => total + row.removed, 0)
+      const content = scrubbed.content.text
+      if (!content) {
+        throw new Error(scrubbed.content.removed > 0
+          ? 'save_memory: content is empty after removing <private> spans — nothing to store'
+          : 'save_memory: content is required')
+      }
+      const keyPointArg = scrubbed.keyPoint.text
+      const titleArg = scrubbed.title.text
+      const profileArg = scrubbed.profile.text
+      // v2.20: file coordinates ride with the memory (read vs modified matters
+      // for "what changed here before"; a later edit upgrades a read).
+      const files = normalizeFiles(args.files)
 
       // v2.4 gate 1: a closed list of events that have occurred. Merely
       // considering whether something is worth remembering is not one of them.
@@ -1103,9 +1284,74 @@ function setupTools(ctx, config) {
         )
       }
 
-      // Session tier: append the full memory to this session's file.
+      // v2.22: a correction edits the EXISTING text instead of appending to it.
+      const isCorrection = trigger === 'correction'
+      const requestedSessionId = typeof args.sessionId === 'string' && args.sessionId.trim().length > 0
+        ? safeSessionId(args.sessionId)
+        : null
+      if (requestedSessionId !== null && !isCorrection) {
+        throw new Error("save_memory: sessionId is only accepted for trigger='correction' — a normal save always writes to the current session.")
+      }
+      if (isCorrection && supersedes.length === 0) {
+        throw new Error("save_memory: trigger='correction' requires supersedes — list the stale fragment(s) so the old line can be removed. Use recall_memory to read the exact text first.")
+      }
+      if (supersedes.length > MAX_SUPERSEDES) {
+        throw new Error(`save_memory: supersedes accepts at most ${MAX_SUPERSEDES} fragments (got ${supersedes.length}).`)
+      }
+      const targetSessionId = isCorrection ? (requestedSessionId ?? sessionId) : sessionId
+
+      // Session tier: correct the stored memory, or append the full memory.
       let doc
-      if (sessionId !== null) {
+      let correctedInfo = null
+      if (isCorrection) {
+        if (targetSessionId === null) {
+          throw new Error('save_memory: a correction needs a session context or an explicit sessionId.')
+        }
+        doc = await readSessionMemory(config, targetSessionId)
+        if (doc === null || !Array.isArray(doc.memories) || doc.memories.length === 0) {
+          throw new Error(`save_memory: no stored memory for session ${targetSessionId} — nothing to correct.`)
+        }
+        const record = doc.memories[0]
+        const removal = removeSupersededLines(record.content, supersedes)
+        if (removal.removedLines === 0) {
+          throw new Error(
+            `save_memory: no stored line matched supersedes in session ${targetSessionId} — nothing was corrected. `
+            + `Use recall_memory({ scope: 'session', sessionId: '${targetSessionId}' }) to read the exact text, `
+            + 'then retry with a fragment copied from it (or rewrite the whole memory in the plugin page: 插件页 → 会话记忆 → 重写).',
+          )
+        }
+        // Preview the append on a clone, so an overflow leaves the store untouched.
+        const preview = { ...doc, memories: [{ ...record, content: removal.text }] }
+        const previewOutcome = mergeIntoSessionMemory(preview, content, normalizeCategory(args.category, null), files)
+        if (previewOutcome.overflow !== undefined) {
+          throw new Error(
+            `save_memory: correction rejected — this session's single memory would reach ${previewOutcome.overflow} `
+            + `characters (cap ${SESSION_MEMORY_MAX_CHARS}); compress it first (插件页 → 会话记忆 → 整理该会话) and retry.`,
+          )
+        }
+        if (titleArg.length > 0) doc.title = titleArg
+        const next = preview.memories[0]
+        next.correctedAt = Date.now()
+        next.correctedCount = Number(record.correctedCount ?? 0) + 1
+        const snapshot = await snapshotSessionForCorrection(config, targetSessionId)
+        doc.memories = preview.memories
+        doc.updatedAt = next.correctedAt
+        doc.origin = { ...(isRecord(doc.origin) ? doc.origin : {}), lastWriter: ownSessionId }
+        await writeSessionMemory(config, targetSessionId, doc)
+        await recordCorrection(config, {
+          at: next.correctedAt,
+          sessionId: targetSessionId,
+          trigger,
+          evidence: evidence.slice(0, 300),
+          supersedes,
+          removedLines: removal.removedLines,
+          beforeChars: Array.from(String(record.content ?? '')).length,
+          afterChars: Array.from(String(next.content ?? '')).length,
+          snapshot,
+          correctingSession: ownSessionId,
+        })
+        correctedInfo = { corrected: true, removedLines: removal.removedLines }
+      } else if (sessionId !== null) {
         doc = (await readSessionMemory(config, sessionId)) ?? {
           sessionId,
           title: null,
@@ -1123,39 +1369,66 @@ function setupTools(ctx, config) {
         // (deduplicated append) instead of appending a new list item. v2.4 gate 3
         // (idempotent writes) lives inside the same rule: an already-covered fact
         // is reported as a no-op rather than accumulated again.
-        const saveCategory = typeof args.category === 'string' && args.category.length > 0 ? args.category : DEFAULT_CATEGORY
-        const outcome = mergeIntoSessionMemory(doc, content, saveCategory)
+        const saveCategory = normalizeCategory(args.category, null)
+        const outcome = mergeIntoSessionMemory(doc, content, saveCategory, files)
         if (outcome.created === false && outcome.merged === false) {
-          return { stored: false, sessionId, trigger, reason: outcome.reason, total: doc.memories.length }
+          // A repeated fact still contributes coordinates: persist the file list
+          // and refresh the derived index instead of pretending nothing happened.
+          const record = doc.memories.at(-1)
+          if (outcome.filesChanged === true) {
+            await writeSessionMemory(config, sessionId, doc)
+            await indexUpsert(config, {
+              sessionId,
+              memoryId: record.id,
+              category: record.category,
+              content: record.content,
+              createdAt: record.createdAt,
+              files: record.files,
+            })
+          }
+          return {
+            stored: false,
+            ...(sessionId !== null ? { sessionId } : {}),
+            trigger,
+            reason: outcome.reason,
+            total: doc.memories.length,
+            ...(record !== undefined && Array.isArray(record.files) ? { fileCount: record.files.length } : {}),
+          }
         }
-        if (typeof args.title === 'string' && args.title.trim().length > 0) doc.title = args.title.trim()
+        if (titleArg.length > 0) doc.title = titleArg
         await writeSessionMemory(config, sessionId, doc)
       }
 
-      // Global tier: derive/refresh the compact entry for this session.
-      const keyPoint = normalizeKeyPoint(args.keyPoint, content)
-      const category = typeof args.category === 'string' && args.category.length > 0 ? args.category : DEFAULT_CATEGORY
+      // Global tier: derive/refresh the compact entry for this session. A
+      // correction may target a stored session other than the current one, and
+      // the entry and the search index must follow that target.
+      const entrySessionId = isCorrection ? targetSessionId : sessionId
+      const keyPointSource = isCorrection && doc?.memories?.[0] !== undefined
+        ? String(doc.memories[0].content ?? '')
+        : content
+      const keyPoint = normalizeKeyPoint(keyPointArg, keyPointSource)
+      const category = normalizeCategory(args.category, null)
       // Serialized per root: concurrent saves must not lose each other's entry.
       const entry = await withGlobalLock(config, async () => {
         const globalEntries = await readGlobal(config)
-        let current = globalEntries.find((e) => e.sessionId === sessionId)
+        let current = globalEntries.find((e) => e.sessionId === entrySessionId)
         if (current === undefined) {
           current = {
             id: `g-${randomUUID()}`,
-            sessionId,
-            title: typeof args.title === 'string' && args.title.trim().length > 0
-              ? args.title.trim()
+            sessionId: entrySessionId,
+            title: titleArg.length > 0
+              ? titleArg
               : (doc && doc.title) || `${Array.from(content).slice(0, 12).join('')}…`,
             keyPoints: keyPoint,
             keywords: [],
             lastActivity: Date.now(),
-            category,
+            category: category ?? DEFAULT_CATEGORY,
           }
           globalEntries.push(current)
         } else {
           if (keyPoint) current.keyPoints = keyPoint
-          if (typeof args.title === 'string' && args.title.trim().length > 0) current.title = args.title.trim()
-          current.category = category
+          if (titleArg.length > 0) current.title = titleArg
+          if (category !== null) current.category = category
           current.lastActivity = Date.now()
         }
         globalEntries.sort((a, b) => Number(b.lastActivity ?? 0) - Number(a.lastActivity ?? 0))
@@ -1166,8 +1439,8 @@ function setupTools(ctx, config) {
       // Profile tier: merge a profile-worthy point if the model judged one.
       let profileUpdated = false
       let profileSection = null
-      if (typeof args.profileUpdate === 'string' && args.profileUpdate.trim().length > 0) {
-        const merged = await mergeProfilePoint(config, args.profileSection, args.profileUpdate)
+      if (profileArg.length > 0) {
+        const merged = await mergeProfilePoint(config, args.profileSection, profileArg)
         if (merged !== null) {
           profileUpdated = true
           profileSection = merged
@@ -1178,11 +1451,12 @@ function setupTools(ctx, config) {
       if (doc && doc.memories.length > 0) {
         const record = doc.memories.at(-1)
         await indexUpsert(config, {
-          sessionId,
+          sessionId: entrySessionId,
           memoryId: record.id,
           category: record.category,
           content: record.content,
           createdAt: record.createdAt,
+          files: record.files,
         })
       }
 
@@ -1192,10 +1466,13 @@ function setupTools(ctx, config) {
       return {
         ...(doc !== undefined && doc.memories.length > 0 ? { id: doc.memories.at(-1).id } : {}),
         stored: true,
-        ...(sessionId !== null ? { sessionId } : {}),
+        ...(entrySessionId !== null ? { sessionId: entrySessionId } : {}),
         trigger,
+        ...(correctedInfo ?? {}),
         globalKeyPoint: entry.keyPoints,
         total: doc ? doc.memories.length : 0,
+        fileCount: Array.isArray(doc?.memories.at(-1)?.files) ? doc.memories.at(-1).files.length : 0,
+        redacted,
         profileUpdated,
         ...(profileSection !== null ? { profileSection } : {}),
       }
@@ -1207,12 +1484,12 @@ function setupTools(ctx, config) {
 
   const recallTool = defineTool({
     name: 'recall_memory',
-    description: "List or search saved long-term memories. scope 'profile' returns the global user profile only; scope 'global' returns the compact per-session index only; scope 'session' returns full session memories (optionally one session via sessionId); scope 'all' (default) merges profile + global + session. Note: full session memories (including the CURRENT session's) are NOT auto-injected into context — call this with a query whenever you need a detail recorded by save_memory, for this session or a past one. Optional query substring and category filters apply.",
+    description: descriptions.recall,
     parameters: {
       query: { type: 'string', description: 'Optional substring to filter memory content by.' },
       category: { type: 'string', description: 'Optional exact category to filter by.' },
-      scope: { type: 'string', description: "Filter scope: 'profile' | 'global' | 'session' | 'all' (default 'all')." },
-      sessionId: { type: 'string', description: 'Optional session id; for scope=session returns only that session\'s full memories.' },
+      scope: { type: 'string', description: "Filter scope: 'profile' | 'global' | 'session' | 'all' (default) | 'timeline' (the window of sessions around one anchor)." },
+      sessionId: { type: 'string', description: "Optional session id: for scope=session returns only that session's full memories; for scope=timeline it is the anchor." },
       limit: { type: 'number', description: 'Optional result limit (default 50).' },
     },
     output: {
@@ -1252,6 +1529,25 @@ function setupTools(ctx, config) {
               },
             },
           },
+          timeline: {
+            type: 'array',
+            items: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                sessionId: { type: 'string' },
+                title: { type: 'string' },
+                keyPoint: { type: 'string' },
+                category: { type: 'string' },
+                at: { type: 'number' },
+                linked: { type: 'boolean' },
+                files: { type: 'number' },
+                anchor: { type: 'boolean' },
+              },
+            },
+          },
+          anchorSessionId: { type: 'string' },
+          anchorFound: { type: 'boolean' },
           sessions: {
             type: 'array',
             items: {
@@ -1270,6 +1566,17 @@ function setupTools(ctx, config) {
                       content: { type: 'string' },
                       category: { type: 'string' },
                       createdAt: { type: 'number' },
+                      files: {
+                        type: 'array',
+                        items: {
+                          type: 'object',
+                          additionalProperties: false,
+                          properties: {
+                            path: { type: 'string' },
+                            action: { type: 'string' },
+                          },
+                        },
+                      },
                     },
                   },
                 },
@@ -1285,6 +1592,12 @@ function setupTools(ctx, config) {
       const query = typeof args.query === 'string' && args.query.length > 0 ? args.query.toLowerCase() : ''
       const category = typeof args.category === 'string' && args.category.length > 0 ? args.category.toLowerCase() : ''
       const limit = typeof args.limit === 'number' && args.limit > 0 ? Math.floor(args.limit) : DEFAULT_RECALL_LIMIT
+      if (scope === 'timeline') {
+        return await buildTimeline(config, {
+          anchorSessionId: typeof args.sessionId === 'string' ? args.sessionId : null,
+          limit,
+        })
+      }
       const wantProfile = scope === 'profile' || scope === 'all'
       const wantGlobal = scope === 'global' || scope === 'all'
       const wantSessions = scope === 'session' || scope === 'all'
@@ -1346,7 +1659,10 @@ function setupTools(ctx, config) {
               sessionRows.push({
                 sessionId: sid,
                 title: doc && typeof doc.title === 'string' ? doc.title : '',
-                memories,
+                memories: memories.map((memory) => ({
+                  ...memory,
+                  files: normalizeFiles(doc?.memories?.find((row) => String(row.id) === memory.id)?.files),
+                })),
               })
             }
           } else if (!indexAvailable) {
@@ -1367,6 +1683,7 @@ function setupTools(ctx, config) {
                   content: String(m.content),
                   category: String(m.category ?? ''),
                   createdAt: Number(m.createdAt ?? 0),
+                  files: normalizeFiles(m.files),
                 }))
               if (memories.length > 0) {
                 sessionRows.push({
@@ -1393,6 +1710,7 @@ function setupTools(ctx, config) {
               content: String(m.content),
               category: String(m.category ?? ''),
               createdAt: Number(m.createdAt ?? 0),
+              files: normalizeFiles(m.files),
             }))
             if (memories.length > 0) {
               sessionRows.push({
@@ -1418,7 +1736,7 @@ function setupTools(ctx, config) {
 
   const loadSessionTool = defineTool({
     name: 'load_session_memory',
-    description: "Load a PAST session's FULL memory into the current conversation (on demand). Call this when the current topic relates to a session listed in the global memory index. The loaded memory is injected as context for subsequent steps.",
+    description: descriptions.load,
     parameters: {
       sessionId: { type: 'string', required: true, description: 'The sessionId from a global memory index entry (or recall_memory).' },
     },
@@ -1446,7 +1764,7 @@ function setupTools(ctx, config) {
       if (text !== undefined && typeof exec.deferContext === 'function') {
         exec.deferContext(createUserMessage({
           content: [{ type: 'text', text }],
-          source: { kind: 'plugin:dsh-memory', form: 'recall' },
+          source: { kind: 'plugin:dsh-structured-memory', form: 'recall' },
         }))
       }
       return {
@@ -1598,7 +1916,7 @@ function setupInjection(ctx, config) {
   const systemPrompt = ctx.systemPrompt
   if (systemPrompt !== undefined && typeof systemPrompt.context === 'function') {
     systemPrompt.context({
-      name: 'dsh-memory',
+      name: 'dsh-structured-memory',
       order: MEMORY_CONTEXT_ORDER,
       text: () => {
         try {
@@ -1632,7 +1950,7 @@ function setupInjection(ctx, config) {
 
     const injected = createUserMessage({
       content: [{ type: 'text', text }],
-      source: { kind: 'plugin:dsh-memory', form: 'recall' },
+      source: { kind: 'plugin:dsh-structured-memory', form: 'recall' },
     })
     return { ...decision, messages: [...decision.messages, injected] }
   })
@@ -1640,7 +1958,7 @@ function setupInjection(ctx, config) {
 
 /* --------------------- config page bridge (v2.5) ------------------------ */
 /*
- * The Plugins page renders dsh-memory's row config from client.js; that page
+ * The Plugins page renders dsh-structured-memory's row config from client.js; that page
  * reads and writes the store through these loopback-only routes. Edits are the
  * same bytes the model writes — JSON is the source of truth — so a hand edit and
  * a save_memory call cannot disagree. Mutations share the per-root lock with
@@ -1648,7 +1966,7 @@ function setupInjection(ctx, config) {
  * because the render cache is keyed by the files' mtime+size.
  */
 
-const STORE_BRIDGE_PATH = '/api/dsh-memory-store'
+const STORE_BRIDGE_PATH = '/api/dsh-structured-memory-store'
 const BRIDGE_BODY_MAX_BYTES = 1024 * 1024
 const BRIDGE_POINT_MAX_CHARS = 4000
 const BRIDGE_TITLE_MAX_CHARS = 200
@@ -1714,7 +2032,7 @@ function blockMetrics(text) {
  * `composeInjection` produces under the byte budget.
  * @param override - pending or preview `{ injectLimit, maxInjectBytes }`.
  */
-function injectionMetrics(config, profile, entries, override = {}) {
+export function injectionMetrics(config, profile, entries, override = {}) {
   const injectLimit = Math.max(1, configNumber(override.injectLimit, configNumber(config.injectLimit, DEFAULT_INJECT_LIMIT)))
   const maxInjectBytes = Math.max(
     1,
@@ -1809,6 +2127,105 @@ function upsertSessionEntry(config, sessionId, fields) {
 }
 
 /**
+ * Excise `<private>…</private>` spans (v2.21). Users mark content that belongs to
+ * the conversation but never to the store; scrubbing runs before the dedup and
+ * length checks so a redacted save is judged on what actually persists.
+ * An unterminated opener drops the rest of the text — a half-tag must never leak
+ * what it was meant to hide.
+ */
+export function stripPrivateSpans(text) {
+  const source = String(text ?? '')
+  const complete = /<private(?:\s[^>]*)?>[\s\S]*?<\/private\s*>/gi
+  const matched = source.match(complete) ?? []
+  const rest = source.replace(complete, '')
+  const danglingAt = rest.search(/<private[\s>]/i)
+  const kept = danglingAt < 0 ? rest : rest.slice(0, danglingAt)
+  return {
+    text: kept.replace(/[ \t]+$/gm, '').replace(/\n{3,}/g, '\n\n').trim(),
+    removed: matched.length + (danglingAt < 0 ? 0 : 1),
+  }
+}
+
+/** Cap on stale fragments a single correction may carry. */
+export const MAX_SUPERSEDES = 10
+/** Bounded audit trail of corrections (newest first). */
+const CORRECTIONS_LOG_LIMIT = 200
+
+/**
+ * Remove every stored line that contains one of the superseded fragments. The
+ * comparison uses the same normalization as the dedup gate, so case, spacing
+ * and punctuation cannot hide the stale line. Returns what was removed so the
+ * caller can refuse a miss instead of appending a contradictory fact.
+ */
+export function removeSupersededLines(text, fragments) {
+  const source = String(text ?? '')
+  const targets = (Array.isArray(fragments) ? fragments : [])
+    .map((fragment) => normalizeMemoryText(fragment))
+    .filter((fragment) => fragment.length > 0)
+  if (targets.length === 0) return { text: source.trim(), removedLines: 0, matched: [] }
+  const kept = []
+  const matched = new Set()
+  let removedLines = 0
+  for (const line of source.split('\n')) {
+    const normalized = normalizeMemoryText(line)
+    const hit = targets.find((target) => normalized.includes(target))
+    if (hit === undefined) {
+      kept.push(line)
+      continue
+    }
+    removedLines += 1
+    matched.add(hit)
+  }
+  return {
+    text: kept.join('\n').replace(/\n{3,}/g, '\n\n').trim(),
+    removedLines,
+    matched: [...matched],
+  }
+}
+
+/** Cap on the file paths one session memory carries, so the stored shape stays bounded. */
+export const MAX_MEMORY_FILES = 50
+
+/**
+ * Normalize a `files` argument into `[{ path, action }]` (v2.20).
+ *
+ * Accepts objects (`{path, action}`) and bare strings (treated as a read), drops
+ * empty paths, de-duplicates by path, and lets `modified` win over `read` — a
+ * file that was edited was also read. First-seen order, so a stable input yields
+ * a stable stored list (and a stable export checksum).
+ */
+export function normalizeFiles(raw) {
+  const out = []
+  const byPath = new Map()
+  for (const item of Array.isArray(raw) ? raw : []) {
+    const rawPath = typeof item === 'string'
+      ? item
+      : (isRecord(item) && typeof item.path === 'string' ? item.path : '')
+    const path = rawPath.trim().replace(/\\/g, '/').slice(0, 200)
+    if (path.length === 0) continue
+    const action = isRecord(item) && item.action === 'modified' ? 'modified' : 'read'
+    const known = byPath.get(path)
+    if (known !== undefined) {
+      if (action === 'modified') known.action = 'modified'
+      continue
+    }
+    if (out.length >= MAX_MEMORY_FILES) continue
+    const entry = { path, action }
+    byPath.set(path, entry)
+    out.push(entry)
+  }
+  return out
+}
+
+/** Union two file lists (existing first, incoming second: a later edit wins). */
+function mergeSessionFiles(existing, incoming) {
+  return normalizeFiles([
+    ...(Array.isArray(existing) ? existing : []),
+    ...normalizeFiles(incoming),
+  ])
+}
+
+/**
  * Fold a session's memories into exactly one entry without an LLM: dedupe exact
  * repeats and join the rest. Used by the save path, by doctor.repair, and by the
  * editor button, so the one-memory-per-session rule never needs a model call.
@@ -1819,18 +2236,39 @@ function upsertSessionEntry(config, sessionId, fields) {
  * the single memory after deduplication. Returns the outcome instead of throwing
  * for the no-op case, so the tool can report it verbatim.
  */
-export function mergeIntoSessionMemory(doc, content, category) {
+export function mergeIntoSessionMemory(doc, content, category, files = []) {
   if (doc.memories.length > 1) collapseSessionMemories(doc)
+  const incoming = normalizeFiles(files)
   const fingerprint = normalizeMemoryText(content)
   const single = doc.memories[0]
   if (single === undefined) {
-    const record = { id: randomUUID(), content, category, createdAt: Date.now(), mergedCount: 1 }
+    const record = {
+      id: randomUUID(),
+      content,
+      category: category ?? DEFAULT_CATEGORY,
+      createdAt: Date.now(),
+      mergedCount: 1,
+      ...(incoming.length > 0 ? { files: incoming } : {}),
+    }
     doc.memories.push(record)
     doc.updatedAt = record.createdAt
-    return { doc, id: record.id, merged: false, created: true }
+    return { doc, id: record.id, merged: false, created: true, filesChanged: incoming.length > 0 }
   }
+  const knownFiles = normalizeFiles(single.files)
+  const nextFiles = mergeSessionFiles(knownFiles, incoming)
+  const filesChanged = nextFiles.length !== knownFiles.length
+    || nextFiles.some((file, index) => file.action !== knownFiles[index].action)
   if (normalizeMemoryText(single.content).includes(fingerprint)) {
-    return { doc, id: single.id, merged: false, created: false, reason: `already contained in this session's single memory ${single.id} — nothing written` }
+    // A repeated fact still carries coordinates: record the files it touched.
+    if (filesChanged) single.files = nextFiles
+    return {
+      doc,
+      id: single.id,
+      merged: false,
+      created: false,
+      filesChanged,
+      reason: `already contained in this session's single memory ${single.id} — ${filesChanged ? 'only the file list was updated' : 'nothing written'}`,
+    }
   }
   const merged = `${single.content}\n${content}`.trim()
   if (Array.from(merged).length > SESSION_MEMORY_MAX_CHARS) {
@@ -1839,16 +2277,21 @@ export function mergeIntoSessionMemory(doc, content, category) {
       id: single.id,
       merged: false,
       created: false,
+      filesChanged: false,
       overflow: Array.from(merged).length,
       reason: `this session's single memory would reach ${Array.from(merged).length} characters (cap ${SESSION_MEMORY_MAX_CHARS}); compress it first (插件页 → 会话记忆 → 整理该会话) and save again`,
     }
   }
   single.content = merged
-  single.category = category
+  // An omitted category keeps the stored label: v2.21 normalization would
+  // otherwise silently downgrade a curated `bugfix`/`security` label to general
+  // on the next save that did not repeat it.
+  if (typeof category === 'string' && category.length > 0) single.category = category
+  if (nextFiles.length > 0) single.files = nextFiles
   single.updatedAt = Date.now()
   single.mergedCount = Number(single.mergedCount ?? 1) + 1
   doc.updatedAt = single.updatedAt
-  return { doc, id: single.id, merged: true, created: false }
+  return { doc, id: single.id, merged: true, created: false, filesChanged }
 }
 
 function collapseSessionMemories(doc) {
@@ -1869,6 +2312,7 @@ function collapseSessionMemories(doc) {
   doc.memories = [{
     ...source[0],
     content: parts.join('\n'),
+    files: normalizeFiles(source.flatMap((memory) => normalizeFiles(memory.files))),
     category: newest.category ?? source[0].category ?? DEFAULT_CATEGORY,
     updatedAt: Date.now(),
     mergedCount: source.length,
@@ -1936,6 +2380,7 @@ async function syncSessionAttributes(config, sessionId, { title, category }) {
       category: single.category,
       content: String(single.content ?? ''),
       createdAt: Number.isFinite(single.createdAt) ? single.createdAt : Date.now(),
+      files: single.files,
     })
   }
   return true
@@ -2020,6 +2465,7 @@ async function repairMemoryLinks(config) {
         category: memory.category,
         content: memory.content,
         createdAt: memory.createdAt,
+        files: memory.files,
       })
     }
     actions.push(`折叠为一条：${row.sessionId}（${row.count} → 1 条）`)
@@ -2064,6 +2510,7 @@ async function repairMemoryLinks(config) {
         category: typeof entry.category === 'string' ? entry.category : single.category,
         content: String(single.content ?? ''),
         createdAt: Number.isFinite(single.createdAt) ? single.createdAt : Date.now(),
+        files: single.files,
       })
     }
     if (docTouched || entryTouched) actions.push(`对齐标题/分类：${row.sessionId}`)
@@ -2280,7 +2727,7 @@ async function snapshotForImport(config, sessionIds) {
   await record('profile.json', 'profile.json')
   await record('global.json', 'global.json')
   for (const id of sessionIds) await record(join('sessions', `${safeSessionId(id)}.json`), `${safeSessionId(id)}.json`)
-  await writeFile(join(dir, 'manifest.json'), JSON.stringify({ kind: 'dsh-memory-import-snapshot', at: Date.now(), files }, null, 2))
+  await writeFile(join(dir, 'manifest.json'), JSON.stringify({ kind: 'dsh-structured-memory-import-snapshot', at: Date.now(), files }, null, 2))
   return `import-${stamp}`
 }
 
@@ -2303,7 +2750,7 @@ async function rollbackImportSnapshot(config, snapshotName) {
         await indexRemove(config, { sessionId })
         const doc = await readSessionMemory(config, sessionId)
         for (const memory of doc?.memories ?? []) {
-          await indexUpsert(config, { sessionId, memoryId: memory.id, category: memory.category, content: memory.content, createdAt: memory.createdAt })
+          await indexUpsert(config, { sessionId, memoryId: memory.id, category: memory.category, content: memory.content, createdAt: memory.createdAt, files: memory.files })
         }
       }
     } else {
@@ -2358,9 +2805,10 @@ async function applyImport(config, bundle, plan, options) {
       summary: null,
       memories: (Array.isArray(source.memories) ? source.memories : []).map((memory) => ({
         id: String(memory.id),
-        content: String(memory.content ?? ''),
+        content: stripPrivateSpans(String(memory.content ?? '')).text,
         category: memory.category ?? DEFAULT_CATEGORY,
         createdAt: Number.isFinite(memory.createdAt) ? memory.createdAt : Date.now(),
+        files: normalizeFiles(memory.files),
       })),
       updatedAt: Date.now(),
       ...(isRecord(source.origin) ? { origin: source.origin } : {}),
@@ -2393,7 +2841,7 @@ async function applyImport(config, bundle, plan, options) {
     let outcome = { merged: false, created: false, reason: 'empty' }
     let overflow = null
     for (const memory of incoming.memories) {
-      outcome = mergeIntoSessionMemory(doc, String(memory.content ?? ''), memory.category ?? DEFAULT_CATEGORY)
+      outcome = mergeIntoSessionMemory(doc, String(memory.content ?? ''), memory.category ?? DEFAULT_CATEGORY, memory.files)
       if (outcome.merged !== true && outcome.created !== true) {
         overflow = outcome.reason ?? 'no-change'
         break
@@ -2415,7 +2863,7 @@ async function applyImport(config, bundle, plan, options) {
     await indexRemove(config, { sessionId })
     const doc = await readSessionMemory(config, sessionId)
     for (const memory of doc?.memories ?? []) {
-      await indexUpsert(config, { sessionId, memoryId: memory.id, category: memory.category, content: memory.content, createdAt: memory.createdAt })
+      await indexUpsert(config, { sessionId, memoryId: memory.id, category: memory.category, content: memory.content, createdAt: memory.createdAt, files: memory.files })
     }
     const originId = report.remapped.find((row) => row.to === sessionId)?.from ?? sessionId
     const bundleEntry = bundleEntryFor.get(originId)
@@ -2461,10 +2909,70 @@ async function listSessionSummaries(config) {
       count: memories.length,
       updatedAt: Number.isFinite(doc.updatedAt) ? doc.updatedAt : null,
       bytes: Buffer.byteLength(JSON.stringify(memories), 'utf8'),
+      fileCount: memories.reduce((total, memory) => total + (Array.isArray(memory.files) ? memory.files.length : 0), 0),
     })
   }
   rows.sort((a, b) => Number(b.updatedAt ?? 0) - Number(a.updatedAt ?? 0))
   return rows
+}
+
+/**
+ * Timeline rows are derived, never stored (v2.21): the global index supplies the
+ * key point and last activity, the session files supply the fallback time and the
+ * file count. A session present in only one of the two stores still appears — that
+ * asymmetry is exactly what the link audit reports.
+ */
+function timelineRows(entries, summaries) {
+  const rows = new Map()
+  for (const entry of entries) {
+    const sessionId = String(entry.sessionId ?? '')
+    if (sessionId.length === 0) continue
+    rows.set(sessionId, {
+      sessionId,
+      title: String(entry.title ?? ''),
+      keyPoint: String(entry.keyPoints ?? ''),
+      category: String(entry.category ?? ''),
+      at: Number(entry.lastActivity ?? 0),
+      linked: false,
+      files: 0,
+    })
+  }
+  for (const summary of summaries) {
+    const row = rows.get(summary.sessionId)
+    if (row === undefined) {
+      rows.set(summary.sessionId, {
+        sessionId: summary.sessionId,
+        title: summary.title ?? '',
+        keyPoint: '',
+        category: summary.category ?? '',
+        at: Number(summary.updatedAt ?? 0),
+        linked: false,
+        files: Number(summary.fileCount ?? 0),
+      })
+      continue
+    }
+    row.linked = true
+    if (row.at === 0) row.at = Number(summary.updatedAt ?? 0)
+    row.files = Number(summary.fileCount ?? 0)
+  }
+  return [...rows.values()].sort((a, b) => b.at - a.at)
+}
+
+/**
+ * The sessions around one anchor (or the newest window when no anchor is given).
+ * `limit` counts rows, not rows per side.
+ */
+export async function buildTimeline(config, { anchorSessionId = null, limit = 9 } = {}) {
+  const rows = timelineRows(await readGlobal(config), await listSessionSummaries(config))
+  const size = Math.max(1, Math.min(25, Number.isFinite(limit) && limit > 0 ? Math.floor(limit) : 9))
+  const anchor = typeof anchorSessionId === 'string' && anchorSessionId.length > 0 ? anchorSessionId : null
+  const anchorIndex = anchor === null ? 0 : rows.findIndex((row) => row.sessionId === anchor)
+  const start = anchorIndex < 0 ? 0 : Math.max(0, anchorIndex - Math.floor((size - 1) / 2))
+  return {
+    timeline: rows.slice(start, start + size).map((row) => ({ ...row, anchor: anchor !== null && row.sessionId === anchor })),
+    anchorSessionId: anchor ?? '',
+    anchorFound: anchor === null ? rows.length > 0 : anchorIndex >= 0,
+  }
 }
 
 /** One session's full memories for the editor. */
@@ -2481,6 +2989,7 @@ async function readSessionDetail(config, sessionId) {
       content: String(memory.content ?? ''),
       category: typeof memory.category === 'string' ? memory.category : DEFAULT_CATEGORY,
       createdAt: Number.isFinite(memory.createdAt) ? memory.createdAt : null,
+      files: normalizeFiles(memory.files),
     })),
   }
 }
@@ -2540,7 +3049,7 @@ function applyStoreOps(webCtx, config, ops) {
         if (!Array.isArray(op.points)) return reject('profile.replace needs a points array')
         const cleaned = []
         for (const point of op.points) {
-          const text = typeof point === 'string' ? point.trim() : ''
+          const text = stripPrivateSpans(typeof point === 'string' ? point.trim() : '').text
           if (!text) continue
           if (text.length > BRIDGE_POINT_MAX_CHARS) {
             return reject(`profile point exceeds ${BRIDGE_POINT_MAX_CHARS} characters`)
@@ -2559,9 +3068,9 @@ function applyStoreOps(webCtx, config, ops) {
       if (op.op === 'global.update') {
         const entry = entries.find((candidate) => candidate.id === op.id)
         if (entry === undefined) return reject(`no global entry with id ${JSON.stringify(op.id)}`)
-        if (typeof op.title === 'string') entry.title = op.title.trim().slice(0, BRIDGE_TITLE_MAX_CHARS)
+        if (typeof op.title === 'string') entry.title = stripPrivateSpans(op.title).text.slice(0, BRIDGE_TITLE_MAX_CHARS)
         if (typeof op.keyPoints === 'string') {
-          entry.keyPoints = normalizeKeyPoint(op.keyPoints.trim().slice(0, BRIDGE_POINT_MAX_CHARS), '')
+          entry.keyPoints = normalizeKeyPoint(stripPrivateSpans(op.keyPoints).text.slice(0, BRIDGE_POINT_MAX_CHARS), '')
         }
         if (typeof op.category === 'string') {
           const category = op.category.trim().slice(0, BRIDGE_CATEGORY_MAX_CHARS)
@@ -2604,7 +3113,7 @@ function applyStoreOps(webCtx, config, ops) {
         const sessionId = safeSessionId(op.sessionId)
         const doc = await readSessionMemory(config, sessionId)
         if (doc === null) return reject(`no session file for ${sessionId}`)
-        const content = String(op.content ?? '').trim()
+        const content = stripPrivateSpans(String(op.content ?? '')).text
         if (content.length === 0) return reject('memory.replace: content is required')
         const length = Array.from(content).length
         if (length > SESSION_MEMORY_MAX_CHARS) return reject(`memory.replace: content is ${length} characters, over the ${SESSION_MEMORY_MAX_CHARS} ceiling`)
@@ -2620,6 +3129,7 @@ function applyStoreOps(webCtx, config, ops) {
           createdAt: Number.isFinite(single?.createdAt) ? single.createdAt : now,
           updatedAt: now,
           mergedCount: 1,
+          files: normalizeFiles(single?.files),
         }
         doc.memories = [next]
         doc.updatedAt = now
@@ -2632,6 +3142,7 @@ function applyStoreOps(webCtx, config, ops) {
           category: next.category,
           content: next.content,
           createdAt: next.createdAt,
+          files: next.files,
         })
         const keyPoint = typeof op.keyPoint === 'string' && op.keyPoint.trim().length > 0
           ? op.keyPoint.trim()
@@ -2669,6 +3180,7 @@ function applyStoreOps(webCtx, config, ops) {
             category: memory.category,
             content: memory.content,
             createdAt: memory.createdAt,
+            files: memory.files,
           })
         }
         await upsertSessionEntryLocked(config, sessionId, { keyPoint: undefined, title: doc.title ?? undefined, category: doc.memories[0]?.category, lastActivity: doc.updatedAt })
@@ -2781,7 +3293,7 @@ function applyStoreOps(webCtx, config, ops) {
  * index, never the memories themselves.
  */
 
-const CONSOLIDATE_PATH = '/api/dsh-memory-consolidate'
+const CONSOLIDATE_PATH = '/api/dsh-structured-memory-consolidate'
 const CONSOLIDATION_DRAFT_TTL_MS = 30 * 60 * 1000
 const CONSOLIDATION_DEFAULT_TOKENS = 32768
 /** Anchors a draft must not lose: URLs, file names, uuids, hashes, numbers. */
@@ -2895,7 +3407,10 @@ export function draftToStore(sections, entries, draft) {
       id: primary,
       title: String(row.title ?? source.title ?? '').trim().slice(0, BRIDGE_TITLE_MAX_CHARS) || source.title,
       keyPoints: normalizeKeyPoint(String(row.keyPoints ?? source.keyPoints ?? ''), ''),
-      category: String(row.category ?? source.category ?? DEFAULT_CATEGORY).trim().slice(0, BRIDGE_CATEGORY_MAX_CHARS) || DEFAULT_CATEGORY,
+      category: normalizeCategory(
+        String(row.category ?? source.category ?? DEFAULT_CATEGORY),
+        source.category ?? DEFAULT_CATEGORY,
+      ),
     }
     if (mergedFrom.length > 0) row2.mergedFrom = mergedFrom
     nextEntries.push(row2)
@@ -2959,7 +3474,7 @@ function resolveConsolidationTarget(config, webCtx, request) {
         : CONSOLIDATION_DEFAULT_TOKENS)
   const fallbackSession = typeof request?.sessionId === 'string' && request.sessionId.trim().length > 0
     ? request.sessionId.trim()
-    : 'dsh-memory-consolidation'
+    : 'dsh-structured-memory-consolidation'
   return {
     provider,
     model,
@@ -3010,7 +3525,7 @@ async function consolidationCatalog(webCtx, provider) {
 }
 
 export const SESSION_CONSOLIDATION_INSTRUCTION = [
-  '下面是 dsh-memory 某个会话的**全部记忆**。请把它们**合成一条**记忆，输出 JSON：',
+  '下面是 dsh-structured-memory 某个会话的**全部记忆**。请把它们**合成一条**记忆，输出 JSON：',
   '{"content":"...","category":"...","keyPoint":"≤50字的整段摘要"}',
   '规则：',
   '1. **只输出一条 content**：把全部仍然有效的事实写进这同一个 content，按主题顺次陈述（用换行或中文分号分隔），不要输出数组、不要分条。',
@@ -3024,6 +3539,9 @@ export const SESSION_CONSOLIDATION_INSTRUCTION = [
   '7. keyPoint 是给"全局索引"用的整段摘要，要与 content 保持一致：目标 ≤50 字；**含路径/命令/版本号等关键标识时可到 100 字**（插件按标识自动放宽）。',
   '7b. **keyPoint 只写高信息浓度的结论，用来让读者知道"该不该去读这一条记忆"**：不写文档位置、不写"细节见 X"、不写绝对路径（插件也会自动剥离）——文档位置放在 content 里。',
   '8. **不得在词中间截断** keyPoint（例如"terminal schedu"、"（清 13"）：宁可写一句更短的完整话；标识与结论不能同时放下时，保留标识并省略铺陈。',
+  '9. **类型保留**：分类只能是 decision / bugfix / security / preference / general；合成结果取素材中优先级最高的类型（security > decision > bugfix > preference > general）。',
+  '   **security 类的事实即使被压缩也不得丢失其中的路径、命令、编号等标识**——这是硬闸，丢锚点会被拒绝应用；',
+  '   decision 保留取舍与理由，bugfix 保留根因与修法，preference 可压成一句。',
 ].join('\n')
 
 /**
@@ -3043,17 +3561,23 @@ function draftToSessionMemories(doc, draft) {
       ?? (rows.length > 0 ? rows.map((row) => (isRecord(row) ? String(row.content ?? '') : '')).filter(Boolean).join('\n') : ''),
   ).trim()
   if (content.length === 0) return []
-  const category = String(draft.category ?? (isRecord(rows[0]) ? rows[0].category : '') ?? newest.category ?? DEFAULT_CATEGORY)
-    .trim()
-    .slice(0, BRIDGE_CATEGORY_MAX_CHARS) || DEFAULT_CATEGORY
+  const sourceCategories = source.map((memory) => normalizeCategory(memory.category))
+  const inherited = CATEGORY_PRIORITY.find((type) => sourceCategories.includes(type)) ?? DEFAULT_CATEGORY
+  const requested = normalizeCategory(draft.category, inherited)
+  // A session that holds a security fact stays security-typed: the label is the
+  // only thing telling a later reader that compression may not drop details.
+  const category = sourceCategories.includes('security')
+    ? 'security'
+    : (requested === DEFAULT_CATEGORY ? inherited : requested)
   const memory = {
     id: String(newest.id),
-    content: content.slice(0, BRIDGE_POINT_MAX_CHARS),
+    content: stripPrivateSpans(content).text.slice(0, BRIDGE_POINT_MAX_CHARS),
     category,
     createdAt: Date.now(),
     // Same bookkeeping the save path maintains: a synthesis starts a new segment.
     updatedAt: Date.now(),
     mergedCount: 1,
+    files: normalizeFiles(source.flatMap((memory) => normalizeFiles(memory.files))),
   }
   const absorbed = source.map((entry) => String(entry.id)).filter((id) => id !== memory.id)
   if (absorbed.length > 0) memory.mergedFrom = absorbed
@@ -3070,6 +3594,14 @@ export function evaluateSessionConsolidation(doc, draft) {
   for (const anchor of collectAnchors(beforeText)) {
     if (!afterText.toLowerCase().includes(anchor)) lostCritical.push(anchor)
   }
+  // v2.21: a security-typed memory may be compressed, but not lose an anchor —
+  // the one type whose coordinates are not negotiable.
+  const lostSecurity = []
+  for (const memory of before.filter((entry) => normalizeCategory(entry.category) === 'security')) {
+    for (const anchor of collectAnchors(String(memory.content ?? ''))) {
+      if (!afterText.toLowerCase().includes(anchor)) lostSecurity.push(anchor)
+    }
+  }
   const kept = new Set(next.map((memory) => memory.id))
   return {
     ok: true,
@@ -3077,15 +3609,16 @@ export function evaluateSessionConsolidation(doc, draft) {
     metrics: { before: { total: blockMetrics(beforeText) }, after: { total: blockMetrics(afterText) } },
     regression: blockMetrics(afterText).chars >= blockMetrics(beforeText).chars,
     lostCritical,
+    lostSecurity,
     removed: before.filter((memory) => !kept.has(String(memory.id))).map((memory) => ({ id: String(memory.id), title: String(memory.content ?? '').slice(0, 60) })),
     merged: next.filter((memory) => Array.isArray(memory.mergedFrom)).map((memory) => ({ id: memory.id, title: memory.content.slice(0, 60), from: memory.mergedFrom })),
     counts: { beforeMemories: before.length, afterMemories: next.length },
   }
 }
 
-const CONSOLIDATION_SYSTEM = '你是 dsh-memory 的记忆整理器。只输出一个 JSON 对象，不要解释、不要 Markdown 代码块。'
+const CONSOLIDATION_SYSTEM = '你是 dsh-structured-memory 的记忆整理器。只输出一个 JSON 对象，不要解释、不要 Markdown 代码块。'
 const CONSOLIDATION_INSTRUCTION = [
-  '下面是 dsh-memory 注入层的当前内容。请压缩它，输出 JSON：',
+  '下面是 dsh-structured-memory 注入层的当前内容。请压缩它，输出 JSON：',
   '{"profile":{"sections":{"identity":"...","work":"...","personal":"...","technical":"...","style":"..."}},"global":[{"fromIds":["<现有 id>"],"title":"...","keyPoints":"≤50字","category":"..."}]}',
   '规则：',
   '1. 只压缩与合并，不新增事实、不改变含义、不做推断。',
@@ -3267,6 +3800,15 @@ function applyConsolidation(config, token) {
   // scope also *resolves contradictions*, so a deliberately dropped memory takes its
   // (outdated) values with it: there the list is reported, not enforced — the volume
   // regression check, the pre-apply snapshot, and the manual apply are the guards.
+  // Security facts get their own hard gate in every scope: a draft that drops
+  // their coordinates is refused, not merely reported.
+  if (Array.isArray(evaluation.lostSecurity) && evaluation.lostSecurity.length > 0) {
+    return Promise.resolve({
+      ok: false,
+      code: 'lost-security',
+      message: `整理会丢失安全类记忆的关键标识，已拒绝应用：${evaluation.lostSecurity.slice(0, 8).join('、')}`,
+    })
+  }
   if (evaluation.lostCritical.length > 0 && pending.scope !== 'session') {
     return Promise.resolve({
       ok: false,
@@ -3301,6 +3843,7 @@ function applyConsolidation(config, token) {
           category: memory.category,
           content: memory.content,
           createdAt: memory.createdAt,
+          files: memory.files,
         })
       }
       // The entry is the only handle on these memories: refresh it (and create it
@@ -3426,7 +3969,7 @@ function dreamStatusText(config) {
   const lines = [
     '记忆整理状态',
     provider.length === 0 || model.length === 0
-      ? '整理模型：未选择（到 插件 → dsh-memory → 整理 里选择并保存，本插件不会自行挑选）'
+      ? '整理模型：未选择（到 插件 → dsh-structured-memory → 整理 里选择并保存，本插件不会自行挑选）'
       : `整理模型：${provider}/${model}${effort.length > 0 ? ` · 档位 ${effort}` : ' · 档位未指定（网关默认，实测更贵）'}`,
     `待处理建议稿：${consolidationDraft === null ? '无' : '有（等待 /dream apply 或 /dream discard）'}`,
   ]
@@ -3511,7 +4054,7 @@ function setupDreamCommand(ctx, config) {
   ctx.inject(['commands'], (commandCtx) => {
     commandCtx.effect(() => {
       const dispose = commandCtx.commands.register({
-        definitionId: 'dsh-memory-dream',
+        definitionId: 'dsh-structured-memory-dream',
         name: 'dream',
         description: '整理记忆：压缩用户画像与全局索引（/dream apply 写入、/dream discard 丢弃、/dream status 查看）',
         // A command that takes arguments MUST advertise an input descriptor:
@@ -3525,7 +4068,7 @@ function setupDreamCommand(ctx, config) {
         dreamCommandRegistered = false
         dispose()
       }
-    }, 'dsh-memory: /dream command')
+    }, 'dsh-structured-memory: /dream command')
   })
 }
 
@@ -3693,7 +4236,7 @@ function setupTransferBridge(ctx, config) {
           sendBridgeJson(res, 200, { ok: false, code: 'transfer-failed', message: error instanceof Error ? error.message : String(error) })
         }
       },
-    }), 'dsh-memory: transfer bridge')
+    }), 'dsh-structured-memory: transfer bridge')
   })
 }
 
@@ -3778,7 +4321,7 @@ function setupStoreBridge(ctx, config) {
           sendBridgeJson(res, 500, { ok: false, code: 'internal', message: error instanceof Error ? error.message : String(error) })
         }
       },
-    }), 'dsh-memory: consolidation bridge')
+    }), 'dsh-structured-memory: consolidation bridge')
 
     webCtx.effect(() => webCtx.webServer.register({
       kind: 'exact',
@@ -3843,7 +4386,7 @@ function setupStoreBridge(ctx, config) {
           })
         }
       },
-    }), 'dsh-memory: store bridge')
+    }), 'dsh-structured-memory: store bridge')
   })
 }
 
@@ -3855,7 +4398,7 @@ export function apply(ctx, config = {}) {
       // Migration must never crash the host; log and continue.
       try {
         // eslint-disable-next-line no-console
-        console.error('[dsh-memory] legacy migration failed:', err)
+        console.error('[dsh-structured-memory] legacy migration failed:', err)
       } catch {
         /* ignore */
       }
@@ -3863,7 +4406,8 @@ export function apply(ctx, config = {}) {
   }
   // Auto backup on startup (v2.2): never crashes the host.
   maybeBackup(config).catch(() => {})
-  setupTools(ctx, config)
+  const skillGuide = registerMemorySkill(ctx)
+  setupTools(ctx, config, { skillGuide })
   setupInjection(ctx, config)
   setupStoreBridge(ctx, config)
   setupTransferBridge(ctx, config)
